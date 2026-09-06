@@ -11,6 +11,7 @@ DOS errorlevel. So from Claude's point of view the DOS machine is just a test ru
   dosctl new NAME                   scaffold projects/NAME/ for a new project
   dosctl clean [--all]              delete regenerable build junk (--all: EXEs too)
   dosctl version                    what build the DOS machine is running
+  dosctl verify                     CRC-32 every tool on the box against the build
   dosctl upgrade [--tools|--agent]  update the DOS machine over the wire
         --dry-run                   ...say what would change, touch nothing
         --force                     redeploy every tool; skip the address guard
@@ -24,6 +25,18 @@ DOS errorlevel. So from Claude's point of view the DOS machine is just a test ru
   dosctl reboot [--cold]            reboot it and wait for it to come back
   dosctl stop                       stop the agent loop (ONE-WAY -- see below)
   dosctl status                     is the DOS box alive and polling?
+  dosctl shutdown                   stop dosd itself (this machine only)
+  dosctl power [status|on|off|cycle]  smart plug, if one is configured
+        reset                       forget the cycle history
+  dosctl capture devices            what capture hardware is on this machine
+        modes                       what the configured device can produce
+        status                      device present? is a picture arriving?
+        live                        watch it live, with sound (q to quit)
+                                    --mute, --scale WxH
+        shot [FILE]                 one still of the DOS box's real screen
+        rec SECS [FILE]             record it. --audio, --shots N
+        burst N [--every S]         a series of stills, S seconds apart
+        still REC SECS [FILE]       pull a frame out of a recording
 
 `stop` leaves the DOS machine at a prompt with nothing polling, so nothing
 here can reach it afterwards -- restarting means someone at its keyboard typing
@@ -51,6 +64,7 @@ import re
 import shutil
 import sys
 import time
+import zlib
 import urllib.error
 import urllib.request
 
@@ -309,7 +323,7 @@ def version_stamp_text(how):
 def read_box_version(args):
     """What the DOS machine says it is running, or None."""
     job = api(args.server, "/queue", {
-        "kind": "raw", "cmds": ["TYPE %s" % AGENT_VER_DOS], "timeout": args.timeout,
+        "kind": "raw", "cmds": ["TYPE %s" % AGENT_VER_DOS], "timeout": args.timeout, "echo": False,
     })
     # Read the result directly rather than through await_result: that helper
     # both prints the output and is the only thing that fills LAST_OUTPUT, so
@@ -368,10 +382,35 @@ def parse_dos_dir(text):
     return out
 
 
-def wait_for_box(server, label, limit=240):
-    """Watch the box drop and come back. Returns True if it returned."""
-    sys.stderr.write("dosctl: %s -- waiting for the box to drop...\n" % label)
-    gone = False
+def _watch_box(server, label, limit=420, back=30, assume_gone=False):
+    """Watch the box drop and come back. Returns True if it returned.
+
+    Both numbers were wrong, and on 2026-09-02 they reported an upgrade that
+    had completely succeeded as a failure: the agent had swapped, the box was
+    polling on the new loop, and dosctl printed rollback instructions and
+    skipped the version stamp. Blaming the box for doing exactly what it was
+    told is the failure this project keeps having to design against.
+
+    `back` was 12 seconds, which is shorter than one poll CYCLE. A poll that
+    gets no reply costs about 11 seconds and the offline branch waits 5 more,
+    so a healthy box regularly shows a last-poll age above 12 and the return
+    can be missed between samples. It has to exceed the worst NORMAL gap.
+
+    `limit` was 240 seconds, and the polls right after a reboot are the least
+    reliable ones: this host's ARP entry for the box has expired by then and
+    our stack does not answer ARP, so several cycles fail before one gets
+    through. Measured here: over five minutes to land the first poll after a
+    swap.
+    """
+    if assume_gone:
+        # After a power cut there is nothing to watch for: the box is
+        # certainly down, and waiting to observe it going down would burn the
+        # whole budget before we ever started waiting for it to come back.
+        sys.stderr.write("dosctl: %s -- waiting for it to boot...\n" % label)
+    else:
+        sys.stderr.write("dosctl: %s -- waiting for the box to drop...\n"
+                         % label)
+    gone = assume_gone
     t0 = time.time()
     while time.time() - t0 < limit:
         time.sleep(2)
@@ -381,12 +420,146 @@ def wait_for_box(server, label, limit=240):
         if not gone and age > 15:
             gone = True
             sys.stderr.write("dosctl:   down, waiting for it to boot...\n")
-        elif gone and age < 12:
+        elif gone and age < back:
             sys.stderr.write("dosctl: back up after %.0fs\n" % (time.time() - t0))
             return True
     sys.stderr.write("dosctl: box did not come back within %ds -- check its screen\n"
                      % limit)
     return False
+
+
+def plug_config(quiet=True):
+    """The smart-plug config, or None if the feature is not set up.
+
+    None is the normal answer -- no power.json ships with the installer -- so
+    every caller treats it as "no plug" and carries on. A config file that IS
+    present but malformed is worth a word, because somebody meant it to work.
+    """
+    try:
+        import power
+    except ImportError:
+        return None
+    try:
+        return power.load()
+    except Exception as e:
+        if not quiet:
+            sys.stderr.write("dosctl: ignoring power config -- %s\n" % e)
+        return None
+
+
+def wait_for_box(server, label, limit=420, back=30, allow_power=True):
+    """Wait for the box, and if it never comes back, try cutting its power.
+
+    This is the whole point of the smart-plug support. Everything else in the
+    bridge assumes a machine that is running well enough to poll; the failures
+    that actually cost time -- a driver that hangs before the network is up, a
+    card that freezes during POST -- leave nothing to talk to, and until now
+    ended in somebody walking over to the machine.
+
+    The retry is bounded by power.may_cycle, not by a count here, and those
+    limits live on disk. A dosctl run in a loop therefore cannot turn a box
+    that will never boot into a machine being power-cycled indefinitely --
+    which is a far worse failure than the one being recovered from.
+    """
+    if _watch_box(server, label, limit, back):
+        return True
+
+    cfg = plug_config()
+    if not cfg or not cfg.get("auto") or not allow_power:
+        return False
+
+    import power
+    while True:
+        ok, why = power.may_cycle(cfg)
+        if not ok:
+            sys.stderr.write("dosctl: not power-cycling -- %s\n" % why)
+            return False
+        sys.stderr.write("dosctl: power-cycling the DOS box...\n")
+        try:
+            power.cycle(cfg, log=lambda m: sys.stderr.write("dosctl: %s\n" % m))
+        except Exception as e:
+            sys.stderr.write("dosctl: power cycle failed -- %s\n" % e)
+            return False
+        if _watch_box(server, "powered back on", limit, back,
+                      assume_gone=True):
+            return True
+
+
+
+# "  crc32 : 468D4151" as HD prints it.
+CRC_LINE = re.compile(r"crc32\s*:\s*([0-9A-Fa-f]{8})")
+
+
+def local_crc(path):
+    with open(path, "rb") as fh:
+        return zlib.crc32(fh.read()) & 0xFFFFFFFF
+
+
+def build_path(build, name):
+    """starter/build holds a mix of cases; the box is always upper."""
+    p = os.path.join(build, name)
+    return p if os.path.isfile(p) else os.path.join(build, name.lower())
+
+
+def verify_tools(args, names, build):
+    """CRC-32 the named tools on the DOS box against the local build.
+
+    Deploying a tool was only ever confirmed with `IF EXIST`, and the
+    pre-flight comparison in upgrade_tools is by SIZE -- so a transfer that
+    arrived corrupted without changing length, or truncated to exactly the
+    expected length, reported success either way. That is not hypothetical:
+    when the box went silent after an upgrade on 2026-09-02 a silently bad
+    UGET.EXE was the leading suspect, and there was no way to rule it out
+    from this side. There is now.
+
+    `HD` on the box produces the same CRC-32 as Python's `zlib.crc32` --
+    proven on a 25,872-byte file -- so this needs no new tool on the DOS
+    side. One job carries every check; a job per file would cost a round
+    trip each.
+
+    Each check is preceded by an `ECHO ##F=<name>` marker rather than trusting
+    the crc32 lines to arrive in request order. A file that is missing makes
+    `HD` print an error and no crc32 line at all, which without the markers
+    would shift every later result by one and mis-report every tool after it.
+
+    Returns (checked, [(name, want, got), ...]), or (None, []) if the box has
+    no HD.EXE to ask.
+    """
+    if not names:
+        return 0, []
+    cmds = []
+    for n in names:
+        cmds.append("ECHO ##F=%s" % n)
+        cmds.append("%s\\HD.EXE %s\\%s 0 1"
+                    % (TOOLS_DIR_DOS, TOOLS_DIR_DOS, n))
+    # HD reads the whole file to checksum it, and these are 8086 disk reads.
+    # Budget per file rather than relying on the default.
+    tmo = max(args.timeout, 30 + 4 * len(names))
+    job = api(args.server, "/queue", {
+        "kind": "raw", "cmds": cmds, "timeout": tmo, "echo": False,
+    })
+    res = api(args.server, "/result/%s" % job["id"], timeout=tmo + 30)
+    out = res.get("output") or ""
+
+    seen, cur = {}, None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("##F="):
+            cur = line[4:].strip().upper()
+        else:
+            m = CRC_LINE.match(line)
+            if m and cur:
+                seen[cur] = m.group(1).upper()
+    if not seen:
+        return None, []
+
+    bad = []
+    for n in names:
+        want = "%08X" % local_crc(build_path(build, n))
+        got = seen.get(n.upper(), "MISSING")
+        if want != got:
+            bad.append((n, want, got))
+    return len(names), bad
 
 
 def upgrade_tools(args, tail, dry, force):
@@ -409,7 +582,7 @@ def upgrade_tools(args, tail, dry, force):
         die("starter/build has no .EXE or .COM -- build the tools first")
 
     job = api(args.server, "/queue", {
-        "kind": "raw", "cmds": ["DIR %s" % TOOLS_DIR_DOS], "timeout": args.timeout,
+        "kind": "raw", "cmds": ["DIR %s" % TOOLS_DIR_DOS], "timeout": args.timeout, "echo": False,
     })
     # Same reason as read_box_version, plus one of its own: await_result would
     # print a 27-line directory listing into the middle of the upgrade report.
@@ -453,6 +626,32 @@ def upgrade_tools(args, tail, dry, force):
             bad += 1
     print()
     print("%d tool(s) sent, %d failed" % (len(todo) - bad, bad))
+
+    # Confirm what actually landed. Size said these files were different;
+    # only a checksum says they are now right.
+    #
+    # Note carefully what a pass does and does not mean when some sends
+    # failed. It says the box's copy matches the build -- NOT that the failed
+    # send succeeded. A --force resend of a file that was already correct
+    # fails harmlessly and still checksums clean, which is genuinely useful
+    # (the failure cost nothing) but reads as "never mind" if the two numbers
+    # are printed side by side without saying so.
+    sent = [n for n, _ in todo]
+    checked, mismatched = verify_tools(args, sent, build)
+    if checked is None:
+        print("not verified: %s\\HD.EXE is not on the box yet"
+              % TOOLS_DIR_DOS)
+    else:
+        for name, want, got in mismatched:
+            sys.stderr.write("dosctl: %s CORRUPT -- local %s, box %s\n"
+                             % (name, want, got))
+        print("checked by CRC-32: %d of %d on the box match the build"
+              % (checked - len(mismatched), checked))
+        if bad and not mismatched:
+            print("  ...so the %d failed send(s) were harmless: the box already"
+                  % bad)
+            print("     held a correct copy. Still worth a retry to be sure.")
+        bad += len(mismatched)
     return 1 if bad else 0
 
 
@@ -489,6 +688,22 @@ def upgrade_agent(args, tail, dry, force):
 
     print("  running : SRV=%s  UPHOST=%s" % (cur_srv, cur_up))
     print("  new     : SRV=%s  UPHOST=%s" % (new_srv, new_up))
+    # A pull that failed leaves cur_srv None, and "None" must not read as
+    # "checked and fine". This guard exists to stop the one mistake that
+    # needs hands on the keyboard, so losing it silently to a dropped
+    # packet is the worst way for it to go -- and the transport is flaky
+    # enough that a single pull fails outright now and then. It did on the
+    # very run that found this.
+    if cur_srv is None:
+        msg = ("could not read the running agent, so its addresses cannot be\n"
+               "      checked against the new one. That check is what stops an\n"
+               "      agent that boots, never polls and needs someone at the\n"
+               "      keyboard. Try again -- a single pull fails now and then --\n"
+               "      or pass --force to swap the agent unchecked.")
+        if not force and not dry:
+            die(msg)
+        sys.stderr.write("dosctl: WARNING -- %s\n" % msg)
+
     if cur_srv and (cur_srv != new_srv or cur_up != new_up):
         msg = ("the new agent points somewhere else. The box is reaching this\n"
                "      server on %s right now; sending an agent that uses %s\n"
@@ -643,16 +858,91 @@ def stage(paths, project=None):
     return names
 
 
-def await_result(server, job_id, timeout):
+# A command that could not be executed. 127 is the conventional shell code
+# for it, and it cannot collide with a DOS program's own exit status: the
+# ERRORLEVEL ladder in dosd.py stops at 20.
+RC_NOEXEC = 127
+
+NOEXEC_MARK = "##NOEXEC="
+
+
+def split_noexec(text):
+    """Lift the not-found markers out of a job's output.
+
+    Returns (clean_output, [programs]). The marker is written by the batch
+    with ECHO, and COMMAND.COM leaves the space that preceded the redirection
+    on the end of the line, so it always arrives with trailing whitespace.
+    """
+    keep, missing = [], []
+    for ln in (text or "").splitlines():
+        s = ln.strip()
+        if s.startswith(NOEXEC_MARK):
+            prog = s[len(NOEXEC_MARK):].strip()
+            if prog:
+                missing.append(prog)
+        else:
+            keep.append(ln)
+    return "\n".join(keep), missing
+
+
+def looks_external(cmd):
+    """Might this command line have run a program, rather than a builtin?"""
+    tok = cmd.strip().split()
+    if not tok:
+        return False
+    word = tok[0].split("\\")[-1]
+    if "." in word:
+        word = word.rsplit(".", 1)[0]
+    return word.upper() not in (
+        "ECHO", "SET", "REM", "CD", "CHDIR", "MD", "MKDIR", "RD", "RMDIR",
+        "DEL", "ERASE", "COPY", "REN", "RENAME", "TYPE", "DIR", "CLS",
+        "PATH", "PROMPT", "VER", "VOL", "DATE", "TIME", "PAUSE", "GOTO",
+        "IF", "FOR", "CALL", "SHIFT", "EXIT", "VERIFY", "BREAK", "CTTY")
+
+
+def await_result(server, job_id, timeout, cmds=None):
     res = api(server, "/result/%s" % job_id, timeout=timeout + 30)
-    LAST_OUTPUT["text"] = res.get("output") or ""
+    out, missing = split_noexec(res.get("output"))
+    LAST_OUTPUT["text"] = out
     if res.get("error"):
         sys.stderr.write("dosctl: %s\n" % res["error"])
         return 124
-    if res.get("output"):
-        sys.stdout.write(res["output"].rstrip("\n") + "\n")
+    if out.strip():
+        sys.stdout.write(out.rstrip("\n") + "\n")
+
     rc = res.get("rc")
-    return rc if rc is not None else 0
+    rc = rc if rc is not None else 0
+
+    # A program that is not there. The DOS box said so on its own screen and
+    # had no way to tell us: COMMAND.COM writes "Bad command or file name" to
+    # a console 6.22 cannot redirect, and leaves ERRORLEVEL alone -- which
+    # EXIT0.COM has just forced to 0. Without this the job reports success.
+    if missing:
+        for p in missing:
+            sys.stderr.write("dosctl: not found on the DOS box: %s\n" % p)
+        sys.stderr.write(
+            "dosctl: the box printed \"Bad command or file name\" on its own "
+            "screen.\n"
+            "        COMMAND.COM writes that to a console this bridge cannot "
+            "capture,\n"
+            "        and it leaves ERRORLEVEL untouched, so the job would "
+            "otherwise\n"
+            "        have reported rc 0 with no output at all.\n")
+        return RC_NOEXEC if rc == 0 else rc
+
+    # The general case: nothing came back, and nothing can prove why. Only
+    # worth saying when a command could actually have been a program -- a job
+    # made of DEL and SET is legitimately silent and should stay quiet.
+    if (not out.strip() and rc == 0 and cmds
+            and any(looks_external(c) for c in cmds)):
+        sys.stderr.write(
+            "dosctl: no output, and rc 0 -- but nothing here proves the "
+            "command ran.\n"
+            "        DOS internal commands never set ERRORLEVEL, and a "
+            "missing program\n"
+            "        reports exactly this. If you expected output, check the "
+            "DOS screen.\n")
+    return rc
 
 
 def main():
@@ -664,17 +954,36 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument("--project", default=None)
     ap.add_argument("--timeout", type=float, default=120)
+    ap.add_argument("--quiet", action="store_true",
+                    help="do not dump this job's output on the DOS console")
     ap.add_argument("--reboot", action="store_true")
     ap.add_argument("--cold", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
 
-    # split our flags out of the tail so program args pass through untouched
+    # Split our flags out of the tail so program args pass through untouched.
+    #
+    # These two lists used to be written out by hand here, and that broke the
+    # moment --quiet was added to the parser above without being added here as
+    # well: it fell straight through into the command tail, and the DOS box
+    # tried to EXECUTE it -- "Bad command or file name", and a job that
+    # reported running two commands when it was given one.
+    #
+    # So derive them from the parser. argparse's _actions is a private
+    # attribute, which is worth it here: the alternative is a second list that
+    # has to be kept in step with the first, and that is precisely what just
+    # failed. If a future argparse renames it this crashes immediately and
+    # loudly, which is the opposite of the silent misparse it replaces.
+    takes_value, is_flag = set(), set()
+    for act in ap._actions:
+        for opt in act.option_strings:
+            (is_flag if act.nargs == 0 else takes_value).add(opt)
+
     argv, passthru = [], []
     it = iter(sys.argv[1:])
     for a in it:
-        if a in ("--server", "--timeout", "--out", "--device", "--project"):
+        if a in takes_value:
             argv += [a, next(it, "")]
-        elif a in ("--reboot", "--cold", "-h", "--help"):
+        elif a in is_flag:
             argv.append(a)
         else:
             passthru.append(a)
@@ -684,6 +993,337 @@ def main():
     if args.help or not args.cmd:
         print(__doc__)
         return 0
+
+    if args.cmd == "verify":
+        build = os.path.join(HERE, "starter", "build")
+        if not os.path.isdir(build):
+            die("no starter/build -- nothing to compare the box against")
+        names = sorted(f.upper() for f in os.listdir(build)
+                       if f.lower().endswith((".exe", ".com")))
+        if not names:
+            die("starter/build has no .EXE or .COM")
+        print("CRC-32 checking %d tool(s) in %s against starter/build."
+              % (len(names), TOOLS_DIR_DOS))
+        print("HD reads every byte on an 8086, so give it a minute.")
+        checked, mismatched = verify_tools(args, names, build)
+        if checked is None:
+            die("%s\\HD.EXE is not on the box -- cannot verify" % TOOLS_DIR_DOS)
+        for name, want, got in mismatched:
+            print("  %-14s %s  local %s  box %s"
+                  % (name, "MISSING" if got == "MISSING" else "MISMATCH",
+                     want, got))
+        print()
+        print("%d checked, %d match, %d differ"
+              % (checked, checked - len(mismatched), len(mismatched)))
+        return 1 if mismatched else 0
+
+    if args.cmd == "shutdown":
+        # Not api(): dosd answers this in plain text, because a daemon on its
+        # way down is a poor moment to depend on anything more elaborate.
+        url = "http://%s/shutdown" % args.server
+        try:
+            with urllib.request.urlopen(
+                    urllib.request.Request(url, data=b""), timeout=10) as r:
+                r.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                die("the running dosd predates this command. Stop it with "
+                    "Ctrl-C in\n      its window and restart it; after that "
+                    "`dosctl shutdown` works.")
+            die("dosd refused: %s" % e.read().decode(errors="replace").strip())
+        except urllib.error.URLError:
+            print("dosd is not running at %s -- nothing to stop." % args.server)
+            return 0
+        # Confirm it actually went, rather than reporting the request as the
+        # outcome. The same mistake as calling an upgrade successful because
+        # the batch was sent.
+        for _ in range(20):
+            time.sleep(0.25)
+            try:
+                urllib.request.urlopen(
+                    "http://%s/status" % args.server, timeout=2).read()
+            except Exception:
+                print("dosd stopped.")
+                return 0
+        print("dosd acknowledged the request but is still answering.")
+        return 1
+
+    if args.cmd == "power":
+        try:
+            import power
+        except ImportError:
+            die("power.py is missing from %s" % HERE)
+        # `tail`, not args.rest: the parser only ever sees the first
+        # passthru word (it becomes args.cmd), so args.rest is always empty
+        # here and every action silently read as "status".
+        action = (tail[0].lower()
+                  if tail and not tail[0].startswith("-")
+                  else "status")
+        force = "--force" in tail
+
+        if action == "reset":
+            power.reset_history()
+            print("power: cycle history cleared")
+            return 0
+
+        try:
+            cfg = power.load()
+        except power.PowerError as e:
+            die(str(e))
+        if cfg is None:
+            print("No smart plug configured.")
+            print()
+            print("  Smart-plug support is optional and off by default. To")
+            print("  enable it, copy power.example.json to power.json and")
+            print("  fill in your plug's model and address:")
+            print()
+            print("      copy power.example.json power.json")
+            print()
+            print("  Tested: Shelly Gen2/3/4. Also written, but never run")
+            print("  against hardware: shelly-gen1, tasmota, kasa,")
+            print("  homeassistant, and a generic http driver you point at")
+            print("  your own URLs.")
+            return 1
+
+        try:
+            if action == "status":
+                d, st, line = power.describe(cfg)
+                print("plug    : %s at %s" % (d.name, cfg.get("host") or "-"))
+                try:
+                    print("device  : %s" % d.info())
+                except power.PowerError:
+                    pass
+                print("state   : %s" % line)
+                # Power draw is the useful part: it separates a machine that
+                # is off from one that has power and has hung, and those need
+                # opposite responses.
+                if st.get("on") and st.get("watts") is not None:
+                    print("          %s"
+                          % ("drawing current, so the machine has power"
+                             if st["watts"] > 2 else
+                             "on, but drawing almost nothing -- the machine "
+                             "itself may be off"))
+                hist = power.recent_cycles(cfg)
+                print("cycles  : %d in the last %.0f min (max %d)"
+                      % (len(hist), float(cfg.get("window_secs") or 3600) / 60,
+                         int(cfg.get("max_cycles") or 3)))
+                return 0
+
+            if action in ("on", "off"):
+                power.driver(cfg).set(action == "on")
+                print("power: switched %s" % action.upper())
+                return 0
+
+            if action == "cycle":
+                # Ask the guards BEFORE announcing anything. The warning used
+                # to print first, so a refused attempt still told you the
+                # machine had just been hard-cut when nothing had happened --
+                # exactly the kind of misreporting this project keeps having
+                # to design against.
+                allowed, why = power.may_cycle(cfg, force=force)
+                if not allowed:
+                    die(why)
+                print("Power-cycling the DOS box. This is a HARD cut -- the")
+                print("same as pulling the plug, with no chance for DOS to")
+                print("flush anything it has open.")
+                power.cycle(cfg, force=force)
+                return 0
+        except power.PowerError as e:
+            die(str(e))
+
+        die("unknown power action %r -- use status, on, off, cycle or reset"
+            % action)
+
+    if args.cmd == "capture":
+        try:
+            import capture
+        except ImportError:
+            die("capture.py is missing from %s" % HERE)
+
+        # `tail`, not args.rest -- same trap the power block documents above.
+        words = [t for t in tail if not t.startswith("-")]
+        action = words[0].lower() if words else "status"
+        rest = words[1:]
+
+        def flag(name):
+            return name in tail
+
+        def opt(name, default=None):
+            """Values for flags the main parser does not know about: argparse
+            leaves both the flag and its value in the tail."""
+            if name in tail:
+                i = tail.index(name)
+                if i + 1 < len(tail):
+                    v = tail[i + 1]
+                    if v in rest:
+                        rest.remove(v)
+                    return v
+            return default
+
+        scale = opt("--scale")
+        shots = int(opt("--shots", 0) or 0)
+
+        try:
+            # `devices` deliberately works with no capture.json, because it
+            # is what you need in order to write one.
+            if action == "devices":
+                video, audio = capture.list_devices(capture.load()
+                                                    if os.path.isfile(
+                                                        capture.CONFIG_PATH)
+                                                    else None)
+                print("video capture devices:")
+                for v in video or ["  (none)"]:
+                    print("  %s" % v)
+                print()
+                print("audio capture devices:")
+                for a in audio or ["  (none)"]:
+                    print("  %s" % a)
+                if video:
+                    print()
+                    print("To enable capture, copy capture.example.json to")
+                    print("capture.json and set:")
+                    print()
+                    # Only offer a value when there is no choice to get wrong.
+                    # A webcam and a capture card look identical from here,
+                    # and naming the webcam because it sorted first would be
+                    # a confident wrong answer rather than no answer.
+                    if len(video) == 1:
+                        print('    "device": %s,' % json.dumps(video[0]))
+                    else:
+                        print('    "device": "<one of the %d above>",'
+                              % len(video))
+                    if len(audio) == 1:
+                        print('    "audio_device": %s' % json.dumps(audio[0]))
+                    elif audio:
+                        print('    "audio_device": "<the one on the same '
+                              'card, or null>"')
+                    print()
+                    print("The name must match exactly. `doscap modes` then")
+                    print("says what that device can actually produce.")
+                return 0
+
+            cfg = capture.load()
+        except capture.CaptureError as e:
+            die(str(e))
+
+        if cfg is None:
+            print("No capture device configured.")
+            print()
+            print("  Video capture is optional and off by default. It lets")
+            print("  this bridge SEE the DOS box's real video output -- POST,")
+            print("  the F1 prompt, a frozen screen, a graphical demo as it")
+            print("  actually renders -- none of which can go through DOS.")
+            print()
+            print("      python dosctl.py capture devices")
+            print("      copy capture.example.json capture.json")
+            print()
+            print("  Then edit capture.json with the device name it printed.")
+            return 1
+
+        try:
+            if action == "status":
+                info = capture.describe(cfg)
+                print("ffmpeg  : %s" % info["ffmpeg"])
+                print("device  : %s%s" % (info["device"],
+                                          "" if info["present"]
+                                          else "   ** NOT FOUND **"))
+                if info.get("audio_device"):
+                    print("audio   : %s%s" % (info["audio_device"],
+                                              "" if info["audio_present"]
+                                              else "   ** NOT FOUND **"))
+                if not info["present"]:
+                    print()
+                    print("Devices that ARE present:")
+                    for v in info["video_devices"] or ["  (none)"]:
+                        print("  %s" % v)
+                    return 1
+                print("format  : %s %s @ %s fps"
+                      % (cfg["video_size"], cfg["pixel_format"],
+                         cfg["framerate"]))
+                print("frame   : %s in %.1fs"
+                      % (info["verdict"], info["shot_secs"]))
+                print("          %s" % info["detail"])
+                print("saved   : %s" % info["shot"])
+                return 0
+
+            if action == "modes":
+                modes = capture.list_modes(cfg)
+                if not modes:
+                    die("the device listed no modes -- is it in use?")
+                print("%-10s %-12s %s" % ("format", "size", "max fps"))
+                for fmt, size, fps in modes:
+                    print("%-10s %-12s %s" % (fmt or "?", size, fps))
+                return 0
+
+            if action == "shot":
+                p = capture.shot(cfg, rest[0] if rest else None, scale=scale)
+                verdict, detail = capture.analyse(p)
+                print("%s" % p)
+                print("  %s -- %s" % (verdict, detail))
+                return 0
+
+            if action == "rec":
+                if not rest:
+                    die("how many seconds? e.g. doscap rec 20")
+                try:
+                    secs = float(rest[0])
+                except ValueError:
+                    die("rec wants seconds, not %r" % rest[0])
+                path, made = capture.record(
+                    cfg, secs, rest[1] if len(rest) > 1 else None,
+                    audio=flag("--audio"), shots=shots)
+                print("%s" % path)
+                for m in made:
+                    print("  %s" % m)
+                return 0
+
+            if action == "live":
+                print("Live preview -- press q or Esc in the window to quit.")
+                print("The device is exclusive, so no shot or rec can run")
+                print("while this is open.")
+                print()
+                print("If it looks frozen it probably is not: an idle DOS")
+                print("console is a still image apart from UGET's spinner.")
+                print("Run MATRIX or RAYCAST to see it move.")
+                # Sound is on by default; --mute turns it off. Note --quiet
+                # cannot be used for that: it is a real dosctl flag, so
+                # argparse eats it before this code ever sees the tail.
+                want = None
+                if flag("--mute") or flag("--no-audio"):
+                    want = False
+                elif flag("--audio"):
+                    want = True
+                print()
+                if want is False:
+                    print("Muted.")
+                else:
+                    print("With sound, played by a second windowless process")
+                    print("so neither stream is synced to the other. HDMI")
+                    print("carries the SOUND CARD only -- the PC speaker is a")
+                    print("separate buzzer and never reaches the capture.")
+                return capture.live(cfg, scale, audio=want)
+
+            if action == "burst":
+                if not rest:
+                    die("how many frames? e.g. doscap burst 6 --every 2")
+                n = int(rest[0])
+                every = float(opt("--every", 2.0))
+                for p in capture.burst(cfg, n, every):
+                    print("%s" % p)
+                return 0
+
+            if action == "still":
+                if len(rest) < 2:
+                    die("usage: doscap still <recording> <seconds> [out.png]")
+                p = capture.still(cfg, rest[0], float(rest[1]),
+                                  rest[2] if len(rest) > 2 else None)
+                print("%s" % p)
+                return 0
+        except capture.CaptureError as e:
+            die(str(e))
+
+        die("unknown capture action %r -- use devices, modes, status, live, "
+            "shot, rec, burst or still" % action)
 
     if args.cmd == "status":
         st = api(args.server, "/status")
@@ -701,21 +1341,11 @@ def main():
 
     if args.cmd == "reboot":
         api(args.server, "/queue", {"kind": "reboot", "cold": args.cold})
-        print("reboot sent, waiting for the box to drop...")
-        gone = False
-        t0 = time.time()
-        while time.time() - t0 < 240:
-            time.sleep(2)
-            age = api(args.server, "/status").get("last_poll_secs_ago")
-            if age is None:
-                continue
-            if not gone and age > 15:
-                gone = True
-                print("  box is down, waiting for it to boot...")
-            elif gone and age < 12:
-                print("back up after %.0fs" % (time.time() - t0))
-                return 0
-        print("box did not come back within 240s -- check its screen")
+        # This was a second, hand-copied version of wait_for_box's loop,
+        # carrying the same two wrong thresholds -- so fixing them meant
+        # finding both, and the copies had already drifted in their wording.
+        if wait_for_box(args.server, "reboot sent"):
+            return 0
         return 124
 
     if args.cmd == "stop":
@@ -734,7 +1364,7 @@ def main():
             "kind": "raw",
             "cmds": [r"COPY C:\AGENT\EXIT0.COM C:\AGENT\STOP.FLG",
                      r"IF EXIST C:\AGENT\STOP.FLG ECHO ##STOP-ARMED"],
-            "timeout": args.timeout,
+            "timeout": args.timeout, "echo": False,
         })
         res = api(args.server, "/result/%s" % job["id"], timeout=args.timeout + 30)
         if res.get("error"):
@@ -896,10 +1526,18 @@ def main():
             die("run needs a program name")
         name = (stage([tail[0]], args.project)[0] if os.path.isfile(tail[0])
                 else resolve_staged(tail[0].upper()))
-        job = api(args.server, "/queue", {
+        payload = {
             "kind": "run", "name": name, "args": " ".join(tail[1:]),
             "timeout": args.timeout, "reboot": args.reboot, "cold": args.cold,
-        })
+        }
+        # Send this key ONLY to turn the echo off. Sending it on every job
+        # pinned the server to an explicit value, and dosd consults its own
+        # default only when the job does not carry one -- so
+        # DOSD_ECHO_OUTPUT was dead for the two commands it exists to
+        # govern. Documented as working before it was tested; it was not.
+        if args.quiet:
+            payload["echo"] = False
+        job = api(args.server, "/queue", payload)
         return await_result(args.server, job["id"], args.timeout)
 
     if args.cmd == "drv":
@@ -955,14 +1593,20 @@ def main():
             })
             return 0 if wait_for_box(args.server, "reboot sent") else 124
 
-        job = api(args.server, "/queue", {
-            "kind": "raw", "cmds": tail, "timeout": args.timeout,
-        })
-        return await_result(args.server, job["id"], args.timeout)
+        payload = {"kind": "raw", "cmds": tail, "timeout": args.timeout}
+        # Send this key ONLY to turn the echo off. Sending it on every job
+        # pinned the server to an explicit value, and dosd consults its own
+        # default only when the job does not carry one -- so
+        # DOSD_ECHO_OUTPUT was dead for the two commands it exists to
+        # govern. Documented as working before it was tested; it was not.
+        if args.quiet:
+            payload["echo"] = False
+        job = api(args.server, "/queue", payload)
+        return await_result(args.server, job["id"], args.timeout, cmds=tail)
 
     die("unknown command '%s' "
         "(try: new clean upgrade version run push deploy pull drv exec "
-        "reboot stop status)"
+        "reboot stop status verify)"
         % args.cmd)
 
 

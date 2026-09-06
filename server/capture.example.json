@@ -1,0 +1,70 @@
+{
+  "_": "Copy this to capture.json and edit it. Nothing here is read unless",
+  "_1": "capture.json exists -- video capture is OFF by default, and an",
+  "_2": "installer never ships a live capture.json. Keys beginning with _ are",
+  "_3": "ignored, so they can be used as comments in a format that has none.",
+
+  "_device": "DirectShow name of the capture card, EXACTLY as ffmpeg lists",
+  "_device2": "it. Run `doscap devices` -- it prints the block to paste here.",
+  "_device3": "This is why the feature needs configuring rather than guessing:",
+  "_device4": "the name belongs to one machine, and a shipped default would be",
+  "_device5": "wrong on every other one.",
+  "device": "USB3.0 Video",
+
+  "_audio": "HDMI carries audio too, and on a DOS box that is the PC speaker",
+  "_audio2": "and the AdLib. It is the only way to check MOZART, AMOZART or",
+  "_audio3": "RAYCAST's music from another machine. null disables `rec --audio`.",
+  "audio_device": null,
+
+  "_geometry": "What to ask the card for. `doscap modes` lists what it can",
+  "_geometry2": "actually do. 1600x1200 is 4:3, which is the shape a DOS box",
+  "_geometry3": "puts out; a 16:9 capture mode letterboxes or stretches it.",
+  "video_size": "1600x1200",
+  "framerate": 60,
+
+  "_pixfmt": "yuyv422 is uncompressed off the stick. mjpeg is the alternative",
+  "_pixfmt2": "and costs less USB bandwidth, but it recompresses text badly --",
+  "_pixfmt3": "which is most of what a DOS screen is.",
+  "pixel_format": "yuyv422",
+
+  "_rtbufsize": "NOT a tuning knob. One 1600x1200 yuyv422 frame is 3.84 MB and",
+  "_rtbufsize2": "ffmpeg's default real-time buffer is about 3 MB -- less than a",
+  "_rtbufsize3": "single frame -- so it drops frames immediately. Raise it with",
+  "_rtbufsize4": "the resolution, not with the length of the recording.",
+  "rtbufsize": "512M",
+
+  "_warmup": "The first frame out of a capture device can be whatever was in",
+  "_warmup2": "its buffer before we opened it, so a snapshot asks for several",
+  "_warmup3": "and keeps the last. Costs warmup_frames/framerate seconds.",
+  "warmup_frames": 6,
+
+  "_preset": "x264 speed. Measured on this hardware at 1600x1200x60:",
+  "_preset2": "ultrafast held 60 fps with ZERO dropped frames; veryfast did",
+  "_preset3": "not keep up and dropped them. If your capture drops frames, make",
+  "_preset4": "this faster before you make anything else smaller.",
+  "preset": "ultrafast",
+  "crf": 23,
+
+  "_preview": "`doscap live` settings. Sound is ON by default; --mute turns",
+  "_preview2": "it off. audio_buffer_ms is how much audio the DEVICE buffers:",
+  "_preview3": "too small starves the renderer and sounds choppy, too large",
+  "_preview4": "lags the picture. 0 uses the device default.",
+  "preview_size": "1280x960",
+  "preview_audio": true,
+  "audio_buffer_ms": 100,
+
+  "_out_dir": "Where shots and recordings land. Relative paths are resolved",
+  "_out_dir2": "against the dosbridge directory. null = <dosbridge>/capture.",
+  "out_dir": null,
+
+  "_ffmpeg": "Full paths, only if ffmpeg is not on PATH. A winget install is",
+  "_ffmpeg2": "found automatically even before the shell has been restarted.",
+  "ffmpeg": null,
+  "ffprobe": null,
+
+  "_open_timeout": "Seconds to wait for the device to open before giving up.",
+  "_open_timeout2": "A capture that cannot open must FAIL rather than wait:",
+  "_open_timeout3": "everything in this project that ever needed hands on the",
+  "_open_timeout4": "keyboard looked like a hang first.",
+  "open_timeout": 30
+}

@@ -1,0 +1,65 @@
+# Write a short story into MS-DOS EDIT, save it, and quit -- with nobody at
+# the keyboard.
+#
+# NO SNAP DIRECTIVES. Measured over three runs: the two containing SNAP both
+# stalled with the File menu open and the next key ignored, and the one
+# without it drove the same Alt-F/accelerator/arrow sequence to a clean exit.
+# SNAP copies 2000 characters out of B800 inside the INT 16h handler, and
+# whatever that disturbs, it costs the keystroke after it. Not needed here
+# anyway: the capture card photographs the screen better than the TSR can.
+#
+# The file is created by the batch BEFORE this runs, so EDIT opens a document
+# that already exists. That matters: opening a name EDIT cannot find puts up a
+# dialog, and a script cannot see whether a dialog is there. Creating it first
+# removes the branch entirely, and plain Save then needs no Save As dialog.
+
+PAUSE 36        # 2s -- cover the gap between KINJ loading and EDIT starting
+KEY Escape      # clear the welcome dialog
+DELAY 3         # typing speed: about six characters a second
+
+TEXT THE MACHINE THAT WOULD NOT SLEEP
+KEY Enter
+KEY Enter
+TEXT In a quiet room there is an old PC. It has an 8086,
+KEY Enter
+TEXT a floppy drive, and no idea that the year is 2026.
+KEY Enter
+KEY Enter
+TEXT Every eight seconds it asks the network whether
+KEY Enter
+TEXT anyone has work for it. Usually nobody does.
+KEY Enter
+KEY Enter
+TEXT Tonight something typed this story into it,
+KEY Enter
+TEXT saved it, and closed the editor.
+KEY Enter
+KEY Enter
+TEXT Nobody was at the keyboard.
+KEY Enter
+
+DELAY 18
+KEY Alt-F       # File menu
+DELAY 9
+TEXT s          # Save -- lowercase, which is what the accelerator wants
+DELAY 27
+KEY Alt-F       # File menu again
+DELAY 9
+TEXT x          # Exit
+DELAY 27
+KEY Enter       # if an exit dialog appeared, take its default
+
+# Fallback, exactly as proven in the exit test: walk the menu instead of
+# using the accelerator. Harmless at the DOS prompt if EDIT already quit.
+KEY Alt-F
+DELAY 9
+KEY Down
+KEY Down
+KEY Down
+KEY Down
+KEY Down
+KEY Enter
+DELAY 18
+KEY Escape      # Escape clears a typed line and executes nothing
+KEY Escape
+END

@@ -10,7 +10,9 @@ param(
 #
 # Changes your system:
 #   * appends the dosbridge folder and the FPC bin folder to your USER PATH
-#   * adds an inbound firewall rule for TCP 8080/8081/8082  (needs admin)
+#   * adds inbound firewall rules for TCP 8080/8081/8082 and UDP 8069
+#     (needs admin). The UDP rule is the important one: TFTP on 8069 is
+#     the transport every job poll, file transfer and result travels on.
 #   * creates the files/ serving directory
 #
 # Everything here is idempotent -- running it twice is harmless. It never
@@ -118,33 +120,50 @@ if (Test-Path $Files) {
 
 # --- firewall ---------------------------------------------------------------
 Write-Output ''
-Write-Output '--- firewall (inbound TCP 8080, 8081, 8082)'
+Write-Output '--- firewall (inbound TCP 8080-8082, UDP 8069)'
 
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
 $admin = (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
              [Security.Principal.WindowsBuiltInRole]::Administrator)
 
-$existing = Get-NetFirewallRule -DisplayName 'dosbridge' -ErrorAction SilentlyContinue
-if ($existing) {
-    Write-Output '  already present : rule "dosbridge"'
-} elseif (-not $admin) {
-    Write-Output '  SKIPPED -- needs Administrator.'
-    Write-Output '  Re-run this in an elevated terminal, or paste this into one:'
-    Write-Output ''
-    Write-Output '    New-NetFirewallRule -DisplayName "dosbridge" -Direction Inbound `'
-    Write-Output '      -Protocol TCP -LocalPort 8080,8081,8082 -Action Allow -Profile Any'
-    Write-Output ''
-    Write-Output '  Without it the DOS box may poll forever and never be answered.'
-} else {
-    # -Profile Any on purpose. A Private-only rule silently does nothing when
-    # Windows has classified the network as Public, and the symptom is a DOS
-    # box that never polls -- which looks like a dead machine, not a firewall.
-    if ($DryRun) {
-        Write-Output '  [dry run] would add the dosbridge firewall rule'
+# Two rules, and the UDP one is not optional. The bridge moved off mTCP onto
+# its own TFTP transport, so UDP 8069 now carries the job poll, every file
+# transfer and every result; the TCP ports are the legacy path. Opening only
+# TCP produces a box that boots, prints a healthy banner and never polls --
+# indistinguishable from a dead machine, which is why they are added together.
+$Rules = @(
+    @{ Name = 'dosbridge';      Proto = 'TCP'; Port = '8080,8081,8082' },
+    @{ Name = 'dosbridge-tftp'; Proto = 'UDP'; Port = '8069' }
+)
+
+foreach ($r in $Rules) {
+    $existing = Get-NetFirewallRule -DisplayName $r.Name -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Output ('  already present : rule "' + $r.Name + '"')
+    } elseif (-not $admin) {
+        Write-Output ('  SKIPPED -- needs Administrator: "' + $r.Name + '"')
+        Write-Output '  Re-run this in an elevated terminal, or paste this into one:'
+        Write-Output ''
+        Write-Output ('    New-NetFirewallRule -DisplayName "' + $r.Name +
+                      '" -Direction Inbound `')
+        Write-Output ('      -Protocol ' + $r.Proto + ' -LocalPort ' + $r.Port +
+                      ' -Action Allow -Profile Any')
+        Write-Output ''
+        Write-Output '  Without it the DOS box may poll forever and never be answered.'
     } else {
-        New-NetFirewallRule -DisplayName 'dosbridge' -Direction Inbound `
-            -Protocol TCP -LocalPort 8080,8081,8082 -Action Allow -Profile Any | Out-Null
-        Write-Output '  created         : rule "dosbridge" (profile Any)'
+        # -Profile Any on purpose. A Private-only rule silently does nothing
+        # when Windows has classified the network as Public, and the symptom is
+        # a DOS box that never polls -- which looks like a dead machine, not a
+        # firewall.
+        if ($DryRun) {
+            Write-Output ('  [dry run] would add rule "' + $r.Name + '"')
+        } else {
+            New-NetFirewallRule -DisplayName $r.Name -Direction Inbound `
+                -Protocol $r.Proto -LocalPort $r.Port -Action Allow `
+                -Profile Any | Out-Null
+            Write-Output ('  created         : rule "' + $r.Name + '" (' +
+                          $r.Proto + ' ' + $r.Port + ', profile Any)')
+        }
     }
 }
 

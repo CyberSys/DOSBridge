@@ -17,7 +17,7 @@ def cli(*args, timeout=60):
     return r
 
 def port_busy(port):
-    """Is something already listening on this port?"""
+    """Is something already listening on this TCP port?"""
     s = socket.socket()
     s.settimeout(0.5)
     try:
@@ -29,12 +29,34 @@ def port_busy(port):
         s.close()
 
 
+def udp_busy(port):
+    """Is something already bound to this UDP port?
+
+    Connecting proves nothing on UDP -- there is no handshake to refuse -- so
+    this binds instead. SO_REUSEADDR is deliberately NOT set: on Windows it
+    lets two processes hold the same port and the kernel then picks between
+    them per datagram, which is how two dosd instances once ran side by side
+    with delivery landing on a coin flip.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.bind(("127.0.0.1", port))
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
+
+
 # This test starts its OWN dosd and its own simulated DOS box. A dosd already
 # running takes port 8080, the copy spawned here cannot bind, and the symptom
 # is a 25 second timeout and an assertion failure that says nothing about the
 # real cause. Better to say so up front.
-for _p in (8080, 8081, 8082):
-    if port_busy(_p):
+# 8069 included: it is the transport now, so a stray listener on it
+# breaks every transfer while the TCP ports look perfectly free.
+for _p, _busy in ((8069, udp_busy), (8080, port_busy),
+                  (8081, port_busy), (8082, port_busy)):
+    if _busy(_p):
         print("selftest: port %d is already in use." % _p)
         print()
         print("  This test runs its own dosd, so a dosd started with dosd.cmd")
@@ -47,8 +69,13 @@ try:
     d = spawn("dosd.py"); time.sleep(1.5)
     s = spawn("simulate_dos.py"); time.sleep(1.5)
 
+    # Deliberately larger than one TFTP block, in both the 512-byte default
+    # and the 1400-byte negotiated size. The old payload was 8 bytes, which is
+    # why this test could not have caught the bug that truncated every
+    # transfer to 513: nothing it moved ever reached a second block.
     PROG = os.path.join(tempfile.gettempdir(), "PROG.EXE")
-    open(PROG, "w").write("MZ fake\n")
+    BLOB = bytes((i * 97 + 13) & 0xFF for i in range(3600))
+    open(PROG, "wb").write(BLOB)
 
     print("### 1. run a program, expect stdout + rc 0")
     r = cli("run", PROG, "--timeout", "25", timeout=60)
@@ -66,13 +93,33 @@ try:
     r = cli("status", timeout=20)
     print(r.stdout.rstrip())
 
-    print("\n### 4. inspect a generated driver JOB.BAT")
+    print("\n### 4. round-trip a file, byte for byte")
+    # The point of this step is the length, not the plumbing. Both directions
+    # of the transport are stop-and-wait with a short final block meaning
+    # "done", so an off-by-one in block sizing produces a file that is
+    # plausible, complete-looking, and wrong -- which is exactly what happened,
+    # and what nothing in this test could see while the payload was 8 bytes.
+    BACK = os.path.join(tempfile.gettempdir(), "PROGBACK.BIN")
+    if os.path.exists(BACK):
+        os.remove(BACK)
+    r = cli("pull", "C:\\WORK\\PROG.EXE", "--out", BACK,
+            "--timeout", "25", timeout=60)
+    print("rc=%d %s" % (r.returncode, r.stdout.rstrip()))
+    assert r.returncode == 0, "pull failed"
+    got = open(BACK, "rb").read()
+    assert len(got) == len(BLOB), (
+        "round trip changed the length: sent %d, got %d"
+        % (len(BLOB), len(got)))
+    assert got == BLOB, "round trip corrupted the bytes"
+    print("   %d bytes out and back, identical" % len(got))
+
+    print("\n### 5. inspect a generated driver JOB.BAT")
     sys.path.insert(0, HERE)
     import dosd
     for ln in dosd.build_driver_batch("abc12345", "NEWDRV.SYS", "/i:3", True):
         print("   " + ln)
 
-    print("\n### 5. errorlevel ladder length: %d lines" % len(dosd.errorlevel_capture()))
+    print("\n### 6. errorlevel ladder length: %d lines" % len(dosd.errorlevel_capture()))
     print("\nALL TESTS PASSED")
 finally:
     for p in procs:

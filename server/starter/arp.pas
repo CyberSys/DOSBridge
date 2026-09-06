@@ -2,17 +2,17 @@ program Arp;
 { DOS Bridge  --  StevenC }
 { Ask "who has this IP?" on the wire, and listen for the answer.
 
-  Usage:  ARP 192.168.50.1          resolve one address
-          ARP 192.168.50.1 -w 3     wait up to 3 seconds for the reply
-          ARP -scan 192.168.50      sweep .1 to .254 and list what answers
-          ARP -scan 192.168.50 -w 4 give the sweep a longer listening window
-          ARP 192.168.50.1 -ip 192.168.50.66    force our sender address
+  Usage:  ARP 192.168.1.1          resolve one address
+          ARP 192.168.1.1 -w 3     wait up to 3 seconds for the reply
+          ARP -scan 192.168.1      sweep .1 to .254 and list what answers
+          ARP -scan 192.168.1 -w 4 give the sweep a longer listening window
+          ARP 192.168.1.1 -ip 192.168.1.20    force our sender address
 
-  Our own IP comes from IPADDR in the file %MTCPCFG% points at -- the same
-  place every mTCP tool reads it. That matters more than it sounds: the first
-  version of this program guessed the sender address as .0 of the target's
-  range, and got no replies at all, because .0 is a network address and hosts
-  are right to ignore an ARP request that claims to come from it.
+  Our own IP comes from the Net unit's NetReadConfig. That matters more than
+  it sounds: the first version of this program guessed the sender address as
+  .0 of the target's range, and got no replies at all, because .0 is a network
+  address and hosts are right to ignore an ARP request that claims to come
+  from it.
 
   Exit code: number of hosts that answered, capped at 20. 0 means silence.
 
@@ -36,7 +36,7 @@ program Arp;
 {$MODE OBJFPC}{$H-}
 {$ASMMODE INTEL}
 
-uses Dos, About;
+uses Dos, About, Net;
 
 const
   MAXPKT  = 1520;
@@ -73,85 +73,20 @@ var
   FoundMac : array[1 .. MAXHOST] of TMac;
   NFound   : Integer;
 
-{ Pull IPADDR out of the mTCP config. Reading a file is a DOS operation, so
-  this must happen -- and does -- before the packet handle is ever opened. }
+{ Our own address, from the Net unit.
+
+  This was a second, hand-written copy of that parser, and it read a config
+  the bridge no longer writes. One reader in one place is the point: the same
+  duplication in the graphics demos meant every fix had to be made twice, and
+  the copy that did not get fixed is the one that shipped. }
 function ReadCfgIP(var A: TIP): Boolean;
-var
-  F    : Text;
-  Line : ShortString;
-  Cfg  : ShortString;
-  I, J : Integer;
-  Key  : ShortString;
-  Rest : ShortString;
-  Part : LongInt;
-  Code : Integer;
-  Cur  : ShortString;
-  N    : Integer;
 begin
   ReadCfgIP := False;
-  Cfg := GetEnv('MTCPCFG');
-  if Cfg = '' then Exit;
-  {$I-}
-  Assign(F, Cfg);
-  Reset(F);
-  {$I+}
-  if IOResult <> 0 then Exit;
-
-  while not Eof(F) do
-  begin
-    {$I-}
-    ReadLn(F, Line);
-    {$I+}
-    if IOResult <> 0 then Break;
-
-    { Split off the first word and upper-case it. }
-    I := 1;
-    while (I <= Length(Line)) and (Line[I] = ' ') do Inc(I);
-    Key := '';
-    while (I <= Length(Line)) and (Line[I] <> ' ') do
-    begin
-      if (Line[I] >= 'a') and (Line[I] <= 'z') then
-        Key := Key + Chr(Ord(Line[I]) - 32)
-      else
-        Key := Key + Line[I];
-      Inc(I);
-    end;
-    if Key <> 'IPADDR' then Continue;
-
-    while (I <= Length(Line)) and (Line[I] = ' ') do Inc(I);
-    Rest := '';
-    while (I <= Length(Line)) and (Line[I] <> ' ') do
-    begin
-      Rest := Rest + Line[I];
-      Inc(I);
-    end;
-
-    N := 0; Cur := '';
-    for J := 1 to Length(Rest) + 1 do
-    begin
-      if (J <= Length(Rest)) and (Rest[J] <> '.') then
-        Cur := Cur + Rest[J]
-      else
-      begin
-        Val(Cur, Part, Code);
-        if (Code <> 0) or (Part < 0) or (Part > 255) or (N > 3) then
-        begin
-          Close(F);
-          Exit;
-        end;
-        A[N] := Byte(Part);
-        Inc(N);
-        Cur := '';
-      end;
-    end;
-    if N = 4 then
-    begin
-      Close(F);
-      ReadCfgIP := True;
-      Exit;
-    end;
-  end;
-  Close(F);
+  if not NetReadConfig then Exit;
+  { Net declares its own TIP. Structurally identical, but a distinct named
+    type, so the bytes are moved rather than assigned. }
+  Move(NetMyIP, A, 4);
+  ReadCfgIP := True;
 end;
 
 { The receiver, byte-identical in shape to pktcap.pas. See the long comment
@@ -511,8 +446,8 @@ begin
   if S = '' then
   begin
     WriteLn('  Nothing to ask about.');
-    WriteLn('    ARP 192.168.50.1        one address');
-    WriteLn('    ARP -scan 192.168.50    the whole /24');
+    WriteLn('    ARP 192.168.1.1        one address');
+    WriteLn('    ARP -scan 192.168.1    the whole /24');
     Halt(0);
   end;
 
@@ -546,7 +481,7 @@ begin
   begin
     if NPart <> 3 then
     begin
-      WriteLn('  -scan wants the first three octets, e.g. -scan 192.168.50');
+      WriteLn('  -scan wants the first three octets, e.g. -scan 192.168.1');
       Halt(0);
     end;
     Base[0] := Byte(Parts[0]); Base[1] := Byte(Parts[1]);
@@ -556,7 +491,7 @@ begin
   begin
     if NPart <> 4 then
     begin
-      WriteLn('  Give all four octets, e.g. 192.168.50.1');
+      WriteLn('  Give all four octets, e.g. 192.168.1.1');
       Halt(0);
     end;
     for I := 0 to 3 do Target[I] := Byte(Parts[I]);
@@ -577,7 +512,7 @@ begin
     if not ReadCfgIP(MyIP) then
     begin
       WriteLn;
-      WriteLn('  Could not read IPADDR from %MTCPCFG%, and no -ip was given.');
+      WriteLn('  No IPADDR in C:\AI\NET.CFG, and no -ip was given.');
       WriteLn('  Without a real sender address the requests would go out');
       WriteLn('  claiming an address nothing will reply to, so stopping here.');
       Halt(0);

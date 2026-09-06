@@ -15,8 +15,8 @@ program PktDrv;
   FPC has no TCP/IP stack for -Tmsdos. There is no Sockets unit, no
   gethostbyname, nothing. What DOS gives you instead is the Packet Driver
   Specification: a small, well-documented interrupt API that a resident driver
-  publishes on one vector between 60h and 80h. mTCP is built on it. Anything we
-  write in Pascal that speaks the network will be too.
+  publishes on one vector between 60h and 80h. Every DOS TCP/IP stack is built
+  on it, and so is everything here that speaks the network.
 
   So this is step one and deliberately stops there. It uses exactly one call --
   driver_info, AH=1Fh -- which takes no handle, registers nothing, allocates
@@ -38,7 +38,10 @@ program PktDrv;
 {$MODE OBJFPC}{$H-}
 {$ASMMODE INTEL}
 
-uses Dos, About;
+{ Net is used only for NET_CFG -- the one definition of where the bridge's
+  network config lives. It has no initialization section and nothing here
+  opens a handle, so this stays the read-only probe it has always been. }
+uses Dos, About, Net;
 
 type
   TFarPtr = packed record
@@ -296,20 +299,30 @@ begin
   else
     WriteLn('  packet drivers found: ', Found);
 
-  { mTCP reads its settings from the file this points at. Worth reporting in
-    the same breath: a driver that is present but a config that is missing is
-    the other half of "why is there no network". }
-  Cfg := GetEnv('MTCPCFG');
+  { Where the addresses come from. Worth reporting in the same breath: a
+    driver that is present but a config that is missing is the other half of
+    "why is there no network".
+
+    Both files, in the order the Net unit tries them. NET.CFG is the one that
+    matters -- it is what UGET, UPUT and NTP read. The legacy path is shown
+    second because it is still the fallback, and because a box that has one
+    and not the other is a half-configured state worth seeing at a glance. }
   WriteLn;
+  if FSearch(NET_CFG, '') <> '' then
+    WriteLn('  ', NET_CFG, ' : present')
+  else
+    WriteLn('  ', NET_CFG, ' : missing');
+
+  Cfg := GetEnv('MTCPCFG');
   if Cfg = '' then
-    WriteLn('  MTCPCFG        : not set (mTCP tools will refuse to run)')
+    WriteLn('  MTCPCFG        : not set (legacy fallback; not needed)')
   else
   begin
     WriteLn('  MTCPCFG        : ', Cfg);
     if FSearch(Cfg, '') <> '' then
-      WriteLn('  config file    : present')
+      WriteLn('  that file      : present')
     else
-      WriteLn('  config file    : MISSING at that path');
+      WriteLn('  that file      : MISSING at that path');
   end;
 
   if Found > 20 then Halt(20);

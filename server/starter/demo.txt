@@ -1,0 +1,17 @@
+# KINJ demo -- drive two CHOICE prompts and photograph each one.
+#
+# Every CHOICE in the batch carries /T, so a missed key means the default is
+# taken and the job moves on. That is the safety net, NOT trailing spare keys:
+# a key left over at the end leaks into COMMAND.COM between batch commands and
+# gets executed as a command.
+
+PAUSE 27        # 1.5s -- cover KINJ loading, the ECHO, and CHOICE starting
+SNAP            # photograph the first prompt, at the moment it asks
+TEXT B          # answer it
+
+DELAY 18        # 1s: long enough that the next key comes due INSIDE the next
+                # CHOICE rather than in the gap between batch commands
+SNAP            # photograph the second prompt
+TEXT Z          # answer it
+
+END             # hand the keyboard back -- no spare keys left to leak

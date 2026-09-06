@@ -1,0 +1,14 @@
+Presence of this file makes build.cmd compile raycast.pas with -O2, into its
+own unit directory rather than the shared one.
+
+The optimisation itself is worth about +7% on the cast and +4% on the frame,
+measured on hardware. It was declined for a long time for a good reason: FPC
+puts compiled units wherever -FU points, build/ is ONE directory shared by
+every target, and so optimised vga/cpu/net .ppu files would be what UGET,
+UPUT and TFTP linked next. Those are the programs the box needs in order to
+be reachable at all; they are I/O bound, so there is nothing there to win,
+and a miscompile in one of them is the failure this project designs against.
+
+Pointing this target at its own -FU directory removes the coupling rather
+than the gain. Nothing else in starter/ is affected, and deleting this file
+puts raycast back on the shared unoptimised units.

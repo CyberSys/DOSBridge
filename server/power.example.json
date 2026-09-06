@@ -1,0 +1,49 @@
+{
+  "_": "Copy this to power.json and edit it. Nothing here is read unless",
+  "_1": "power.json exists -- smart-plug support is OFF by default, and an",
+  "_2": "installer never ships a live power.json. Keys beginning with _ are",
+  "_3": "ignored, so they can be used as comments in a format that has none.",
+
+  "_model": "shelly | shelly-gen1 | tasmota | kasa | homeassistant | http",
+  "_model_note": "Only 'shelly' (Gen2/3/4 RPC) has been tested on real hardware.",
+  "model": "shelly",
+
+  "_host": "IP or hostname of the PLUG -- not of the DOS box.",
+  "host": "192.168.0.50",
+
+  "_channel": "Which relay on a multi-outlet device. 0 for a single plug.",
+  "channel": 0,
+
+  "_auth": "Only if the plug requires it. Shelly Gen2+ uses digest auth.",
+  "username": null,
+  "password": null,
+
+  "_off_secs": "How long to hold the power off. Do not go below ~4: PSU",
+  "_off_secs2": "capacitors keep a small machine alive briefly, and a cycle",
+  "_off_secs3": "the hardware never noticed still looks like it worked.",
+  "off_secs": 6,
+
+  "_limits": "The guards. A recovery that can loop is worse than none: a box",
+  "_limits2": "that will not come back for a reason power cannot fix would",
+  "_limits3": "otherwise be cut every couple of minutes, forever, with nobody",
+  "_limits4": "watching. Counted in power.state so they survive a re-run.",
+  "_max_cycles": "Hard ceiling per window. --force does NOT override this.",
+  "max_cycles": 3,
+  "window_secs": 3600,
+  "_min_interval": "Refuse a second cycle sooner than this. --force overrides.",
+  "min_interval_secs": 90,
+
+  "_auto": "Let dosctl power-cycle by itself when the box fails to come back",
+  "_auto2": "from a reboot or an upgrade. false = manual `dosctl power` only.",
+  "auto": true,
+
+  "_ha": "homeassistant only: a long-lived token and the entity to switch.",
+  "entity_id": null,
+  "token": null,
+
+  "_http": "http driver only: your own URLs. status_url is optional; without",
+  "_http2": "it the state reads as unknown and a cycle proceeds blind.",
+  "on_url": null,
+  "off_url": null,
+  "status_url": null
+}

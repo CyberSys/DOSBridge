@@ -3,14 +3,18 @@
 # Do not run DHCP.EXE against this file. It is one-shot: it stamps
 # TIMESTAMP and LEASE_TIME in here and exits, nothing renews the lease,
 # and when it expires every mTCP tool refuses to run. The agent loop
-# cannot recover from that on its own -- it retries HTGET forever but
-# never re-runs DHCP -- so it costs a trip to the machine.
+# cannot recover from that on its own -- its offline branch retries
+# forever but never re-runs DHCP -- so it costs a trip to the box.
+#
+# The bridge does not read this file at all any more: it reads
+# C:\AI\NET.CFG. This exists only for mTCP's own tools,
+# so if you have no mTCP you can ignore it entirely.
 #
 packetint 0x60
 hostname DOSBOX
 
-IPADDR 192.168.50.66
+IPADDR 192.168.1.20
 NETMASK 255.255.255.0
-GATEWAY 192.168.50.1
-NAMESERVER 192.168.50.1
+GATEWAY 192.168.1.1
+NAMESERVER 192.168.1.1
 MTU 1500

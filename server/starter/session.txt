@@ -1,0 +1,14 @@
+# Example KINJ script.  Compile it with:
+#     python mkkeys.py session.txt > SESSION.KI
+#
+# Then, in ONE job so the TSR is loaded immediately before the target:
+#     dosexec "C:\TOOLS\KINJ.COM C:\WORK\SESSION.KI" "CHOICE /C:AB /N /T:A,10"
+#     dosexec "C:\TOOLS\KINJ.COM /D" "C:\TOOLS\KINJ.COM /U"
+#
+# Ticks are 18.2 a second.
+
+PAUSE 9         # half a second: let the target start and finish drawing
+SNAP            # photograph it at the moment it asks for a key
+TEXT B          # answer
+DELAY 4         # a fifth of a second between anything that follows
+END             # hand the keyboard back to whoever is really at it

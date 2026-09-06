@@ -10,7 +10,19 @@ set TARGET=%1
 if "%TARGET%"=="" set TARGET=hello
 if not exist build mkdir build
 
-fpc -Tmsdos -Pi8086 -WmLarge -FEbuild -FUbuild %TARGET%.pas
+REM  A target opts into optimisation by having <name>.o2 beside it, and gets
+REM  its OWN unit directory when it does -- build\ is shared by every target,
+REM  so optimised units would otherwise follow into the network tools. See
+REM  the .o2 file itself for why that matters.
+set OPTFLAG=
+set UNITDIR=build
+if exist %TARGET%.o2 (
+  set OPTFLAG=-O2
+  set UNITDIR=build-%TARGET%
+  if not exist build-%TARGET% mkdir build-%TARGET%
+)
+
+fpc -Tmsdos -Pi8086 -WmLarge %OPTFLAG% -FEbuild -FU%UNITDIR% %TARGET%.pas
 if errorlevel 1 (
   echo.
   echo BUILD FAILED

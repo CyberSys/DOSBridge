@@ -4,8 +4,13 @@ REM  wrong server says so on its own screen instead of just going quiet.
 REM  `dosctl upgrade --agent` parses these two lines, so leave them alone --
 REM  and never put the words SET S-R-V inside an ECHO, or the guard reads its
 REM  own output back and thinks the address changed.
-SET SRV=192.168.50.46:8080
-SET UPHOST=192.168.50.46
+REM
+REM  Nothing on this box uses SRV any more -- the loop polls UPHOST over
+REM  UDP and mTCP is gone. It stays because it is half of the address
+REM  check above, which is what stops an upgrade from installing an agent
+REM  that points somewhere this machine cannot reach.
+SET SRV=192.168.1.10:8080
+SET UPHOST=192.168.1.10
 
 REM  TZ lives here and not in AUTOEXEC.BAT: a mistake in AUTOEXEC.BAT breaks
 REM  the network before the agent runs and needs hands on the keyboard, while
@@ -26,44 +31,32 @@ REM  rewritten by `dosctl upgrade`, so the box can answer the question
 REM  itself instead of someone having to go and ask the Windows side.
 IF EXIST C:\AI\VERSION.TXT TYPE C:\AI\VERSION.TXT
 ECHO.
-ECHO  jobs from   : %SRV%
-ECHO  results to  : %UPHOST% port 8081
-REM  Its own address, from whichever config mTCP is actually using. When this
-REM  box went silent on an expired DHCP lease that was the missing fact: the
-REM  screen looked healthy and said nothing about the network at all.
+ECHO  server      : %UPHOST%   (UDP 8069, no mTCP)
+REM  Its own address. When this box went silent on an expired DHCP lease that
+REM  was the missing fact: the screen looked healthy and said nothing at all
+REM  about the network.
 REM
-REM  Branched with GOTO rather than chained as "IF NOT ... IF EXIST ... FIND",
-REM  because COMMAND.COM 6.22 honours a chained IF when the command is
-REM  INTERNAL (ECHO, GOTO) and SILENTLY DROPS IT when the command is EXTERNAL.
-REM  FIND is external, so the chained form printed nothing at all and read as
-REM  a missing config file. Copying MTCPCFG to a temp variable first is no
-REM  good either -- it ran the environment out of space and truncated the path.
-IF NOT "%MTCPCFG%"=="" GOTO SHOWIP
-ECHO  own address : MTCPCFG is not set -- check AUTOEXEC.BAT
-GOTO IPDONE
-:SHOWIP
-IF EXIST %MTCPCFG% FIND "IPADDR" %MTCPCFG%
-IF NOT EXIST %MTCPCFG% ECHO  own address : no mTCP config at %MTCPCFG%
-:IPDONE
-ECHO.
-IF EXIST C:\TOOLS\KEYHIT.COM ECHO  To stop the agent: press ScrollLock, or Ctrl-C.
-IF NOT EXIST C:\TOOLS\KEYHIT.COM ECHO  KEYHIT.COM missing from C:\TOOLS - Ctrl-C is the only way out.
-ECHO.
+REM  UGET -INFO rather than FIND on the config file. FIND printed a filename
+REM  header line as well as the address -- two lines, one of them noise -- and
+REM  it could only ever read mTCP's config, not the bridge's own. -INFO
+REM  reports whichever file was actually used, which matters now there are
+REM  two candidates.
+IF EXIST C:\TOOLS\UGET.EXE C:\TOOLS\UGET.EXE -INFO
+IF NOT EXIST C:\TOOLS\UGET.EXE ECHO  address     : UGET.EXE missing, no network
+IF EXIST C:\TOOLS\KEYHIT.COM ECHO  stop        : ScrollLock, or Ctrl-C
+IF NOT EXIST C:\TOOLS\KEYHIT.COM ECHO  stop        : Ctrl-C only (no KEYHIT.COM)
+echo -------------------------------------------------------------------
 REM  Nothing above this line may block or touch the network. All of it runs
 REM  before the agent starts polling, so anything that waits for input -- a
 REM  bare DATE or TIME, a CHOICE with no timeout -- is a machine that boots,
 REM  looks fine, and never calls home. That needs hands on the keyboard.
 REM
-REM  This banner scrolls off within about a minute, and that is a deliberate
-REM  trade rather than a limitation. mTCP prints a version block on every
-REM  poll, straight to the console where > NUL cannot catch it and
-REM  COMMAND.COM 6.22 has no way to redirect it. HTGET -quiet DOES suppress
-REM  it -- verified -- and the loop deliberately does not use it, because
-REM  that chatter is the only continuous sign the machine has not wedged.
-REM  A silent screen and a frozen box look exactly the same, which is the
-REM  failure this bridge keeps having to design around. So the banner is a
-REM  boot-time display: to see it again, stop the agent (the stop message
-REM  repeats the addresses) or reboot.
+REM  This banner now STAYS. It used to scroll away within a minute because
+REM  mTCP printed a version block on every poll straight to the console,
+REM  which "> NUL" cannot catch and COMMAND.COM 6.22 cannot redirect. With
+REM  the poll on our own UDP the loop prints nothing at all; the only moving
+REM  thing is UGET's in-place spinner, and jobs announce themselves as they
+REM  run. So the screen is a live status display rather than a scrollback.
 
 REM ===================================================================
 REM  Crash guard
@@ -82,7 +75,10 @@ ECHO *** Previous boot hung. Reverting and reporting. ***
 COPY C:\AGENT\PENDID.TXT C:\AGENT\RES.TXT > NUL
 ECHO ##BOOTFAIL driver wedged the machine, not loaded this boot >> C:\AGENT\RES.TXT
 ECHO ##RC=253 >> C:\AGENT\RES.TXT
-NC -target %UPHOST% 8081 < C:\AGENT\RES.TXT > NUL
+REM  The crash report is the one thing you cannot afford to lose: it is the
+REM  only way the machine can say WHY it hung. UPUT retransmits internally,
+REM  and if it still fails the next boot has nothing to add anyway.
+C:\TOOLS\UPUT.EXE %UPHOST% C:\AGENT\RES.TXT result
 DEL C:\AGENT\TRYING.FLG
 IF EXIST C:\AGENT\PEND.BAT DEL C:\AGENT\PEND.BAT
 GOTO LOOP
@@ -101,7 +97,7 @@ IF NOT EXIST C:\AGENT\DRVOUT.TXT ECHO (no output captured) >> C:\AGENT\RES.TXT
 ECHO --- MEM /C --- >> C:\AGENT\RES.TXT
 MEM /C >> C:\AGENT\RES.TXT
 ECHO ##RC=0 >> C:\AGENT\RES.TXT
-NC -target %UPHOST% 8081 < C:\AGENT\RES.TXT > NUL
+C:\TOOLS\UPUT.EXE %UPHOST% C:\AGENT\RES.TXT result
 GOTO LOOP
 
 REM ===================================================================
@@ -115,17 +111,24 @@ REM  it leaves TRYING.FLG behind and the next boot reports a driver crash that
 REM  never happened. Ctrl-C stays as the hammer for a job that is truly stuck.
 REM ===================================================================
 
+REM  A flag left by the outage that was in progress when the box went
+REM  down would silence the first [offline] notice after a reboot.
+IF EXIST C:\AGENT\OFFLINE.FLG DEL C:\AGENT\OFFLINE.FLG
+IF EXIST C:\AGENT\OFFSAID.FLG DEL C:\AGENT\OFFSAID.FLG
+
 :LOOP
 IF EXIST C:\AGENT\STOP.FLG GOTO QUIT
 REM  KEYHIT tests the ScrollLock bit in the BIOS keyboard flags -- NOT a
 REM  keystroke. A queued keypress cannot work here: mTCP watches the keyboard
-REM  so ESC can abort a transfer, and it consumes whatever is waiting, so a Q
-REM  pressed during the poll is eaten by HTGET before this line runs. Measured,
-REM  not assumed. ScrollLock is a flag bit nothing else touches, and its LED
+REM  so ESC can abort a transfer, and it consumed whatever was waiting, so a Q
+REM  pressed during the poll was eaten before this line ran. Measured, not
+REM  assumed -- and it still decides the design even though mTCP is gone,
+REM  because a flag bit is simply the right thing to test.
+REM  ScrollLock is a flag bit nothing else touches, and its LED
 REM  shows the state without needing anything on screen.
 REM
 REM  Checked BEFORE the fetch. Keys survive in the flag either way, but after
-REM  the fetch this would throw away a job HTGET had already collected, and
+REM  the fetch this would throw away a job the poll had already collected, and
 REM  dosd would wait for a result that never came and time out calling the box
 REM  hung -- the exact wrong-blame failure these exits exist to avoid.
 REM
@@ -136,34 +139,141 @@ C:\TOOLS\KEYHIT.COM
 IF ERRORLEVEL 1 GOTO QUIT
 :NOKEY
 IF EXIST C:\AGENT\JOB.BAT DEL C:\AGENT\JOB.BAT
-REM  Not -quiet. It works, and it is left off on purpose: see the banner
-REM  note above. The four lines this prints per poll are the heartbeat.
-HTGET -o C:\AGENT\JOB.BAT http://%SRV%/job > NUL
+REM  POLL tells UGET this is the long poll: several seconds per attempt,
+REM  up to three attempts. Retransmitting a poll request is only safe
+REM  because dosd DEDUPLICATES it -- a repeat request from a client it is
+REM  already holding one for is ignored, so it cannot take a second job off
+REM  the queue while the first goes nowhere. Change one without the other
+REM  and jobs start disappearing.
+REM
+REM  UGET draws a spinner in place while it waits, so an idle box still
+REM  shows a pulse without scrolling the banner above away.
+C:\TOOLS\UGET.EXE %UPHOST% job C:\AGENT\JOB.BAT POLL
+REM  There is NO fallback here, and that is the point: this machine needs
+REM  no part of mTCP to do its job. The HTGET line that used to sit here
+REM  was removed on 2026-09-02 after the poll was measured clean over a
+REM  long run -- it had been carrying roughly one poll in five.
+REM
+REM  A lost poll is now simply a lost poll: UGET gives up, the OFFLINE
+REM  branch waits five seconds and the loop tries again. No job is lost
+REM  by that -- dosd requeues a job whose UDP delivery went unacked, so
+REM  the cost of a miss is latency and nothing else.
+REM
+REM  If this ever needs putting back, it was one line:
+REM    IF NOT EXIST C:\AGENT\JOB.BAT HTGET -quiet -o C:\AGENT\JOB.BAT http://%SRV%/job > NUL
 IF NOT EXIST C:\AGENT\JOB.BAT GOTO OFFLINE
+REM  Coming back after an outage is worth exactly one line. Without
+REM  it the screen goes from an [offline] notice straight into job
+REM  traffic, and there is no way to tell a server that recovered
+REM  from one that was never down.
+IF NOT EXIST C:\AGENT\OFFLINE.FLG GOTO GOTJOB
+REM  Only worth saying if [offline] was actually printed. A single
+REM  dropped poll sets OFFLINE.FLG and says nothing, so it must clear
+REM  just as quietly -- otherwise the recovery line reappears for an
+REM  outage nobody was ever told about.
+IF NOT EXIST C:\AGENT\OFFSAID.FLG GOTO OFFCLR
+ECHO  [online] %UPHOST% is answering again
+DEL C:\AGENT\OFFSAID.FLG
+:OFFCLR
+DEL C:\AGENT\OFFLINE.FLG
+:GOTJOB
 CALL C:\AGENT\JOB.BAT
 GOTO LOOP
 
 :OFFLINE
-ECHO dosd unreachable at %SRV% - retrying, Q quits...
-REM  If CHOICE is missing the errorlevel is HTGET, which is >= 20, so this
-REM  falls to GOTO LOOP. The safe direction: keep polling rather than exit.
-REM  Q works here and nowhere else, because CHOICE reads the keyboard itself.
-CHOICE /C:QY /T:Y,5
+REM  Once per outage, not once per retry. UGET used to print its own
+REM  two-line failure every five seconds and this line added a third;
+REM  one daemon restart cost sixteen rows and scrolled the banner
+REM  away. UGET is now silent on a failed POLL (-V still reports),
+REM  and the retries show as its spinner, which animates in place and
+REM  scrolls nothing.
+REM
+REM  The flag is made with ECHO and not COPY: EXIT0.COM is fetched by
+REM  the first job, so on a box that has not run one yet there is
+REM  nothing to copy, COPY would fail, the flag would never appear
+REM  and the message would be back every five seconds.
+REM  Nothing is said on the FIRST failed poll -- only the second.
+REM
+REM  About one idle poll in six gets no reply on this link: the server's
+REM  'nothing for you' answer is sent after a hold, by which time this
+REM  host's ARP entry for the box may have lapsed, and nothing here
+REM  answers ARP. Announcing the first miss turned each of those single
+REM  dropped packets into an [offline] and an [online] -- two lines for
+REM  an event that cost 5 seconds and lost nothing. Waiting for a second
+REM  consecutive failure is what separates a dropped packet from a
+REM  server that is actually gone.
+IF EXIST C:\AGENT\OFFLINE.FLG GOTO OFFSAY
+ECHO . > C:\AGENT\OFFLINE.FLG
+GOTO OFFWAIT
+:OFFSAY
+IF EXIST C:\AGENT\OFFSAID.FLG GOTO OFFWAIT
+ECHO  [offline] no reply from %UPHOST% - retrying, Q quits
+ECHO . > C:\AGENT\OFFSAID.FLG
+:OFFWAIT
+REM  /N hides CHOICE's own "[Q,Y]?" prompt, which was the ugliest thing on
+REM  the screen. The line above already says what the keys are.
+REM
+REM  Q works here and nowhere else, because CHOICE reads the keyboard
+REM  itself. > NUL catches CHOICE's echo of the answer it picked: /N hides
+REM  the prompt but NOT the chosen character, so every timed-out retry
+REM  printed a bare "Y" -- one line per retry, which is most of what moving
+REM  the [offline] notice behind a flag was meant to stop. Redirecting its
+REM  stdout does not stop Q from working.
+REM
+REM  EXIT0.COM first, and this is load-bearing. The test below used to be a
+REM  bare "IF ERRORLEVEL 2 GOTO LOOP / GOTO QUIT", whose comment claimed a
+REM  CHOICE that did not run was safe because "the errorlevel is whatever
+REM  the poll left, which is 20 or more". That was true of the old fetch
+REM  tool, which returned 20 or more even on success. It stopped being true
+REM  the day the poll became UGET, whose exit code is honest: a failed poll
+REM  leaves 1.
+REM
+REM  Note the wording, not only the logic. A greater-than sign immediately
+REM  followed by an equals sign is read by COMMAND.COM as a redirection with
+REM  no filename, even inside a REM, and prints "Syntax error" on the console
+REM  every time the line is reached. Nothing is created and nothing breaks --
+REM  REM does not open the file -- but it is noise on a screen whose whole
+REM  job is to be readable. An arrow like "-" then ">" is fine, and so is an
+REM  equals then a greater-than; only that one pairing is malformed.
+REM  Verified on hardware 2026-09-03.
+REM
+REM  So the fallback had silently inverted. Reaching here at all means the
+REM  poll just failed, so ERRORLEVEL was 1, and 1 is below 2 -- the agent
+REM  quit instead of retrying, on a box nothing could then reach. Anything
+REM  that stops CHOICE resolving (a truncated PATH from a full environment
+REM  is the one to expect here) turns an outage into a stopped agent.
+REM
+REM  Forcing 0 first makes the three cases distinguishable again:
+REM    2  CHOICE timed out          -> keep polling
+REM    1  somebody pressed Q        -> stop
+REM    0  CHOICE never ran, or was interrupted -> keep polling
+REM  Quitting is now the ONLY case that needs positive evidence, which is
+REM  the right way round for the one branch that cannot be undone remotely.
+IF EXIST C:\AGENT\EXIT0.COM C:\AGENT\EXIT0.COM
+CHOICE /C:QY /N /T:Y,5 > NUL
 IF ERRORLEVEL 2 GOTO LOOP
-GOTO QUIT
+IF ERRORLEVEL 1 GOTO QUIT
+GOTO LOOP
 
 :QUIT
 REM  Clear the flag on the way out, or restarting the agent would stop it
 REM  again immediately.
 IF EXIST C:\AGENT\STOP.FLG DEL C:\AGENT\STOP.FLG
 IF EXIST C:\AGENT\JOB.BAT DEL C:\AGENT\JOB.BAT
+REM  Un-arm ScrollLock, for the same reason the flag file is deleted above:
+REM  it LATCHES, so an agent that stopped on it and left it set would stop
+REM  again on its first poll after being restarted. SCRLOFF also puts the
+REM  keyboard lamp out -- the lamp is what somebody standing at the machine
+REM  reads as the armed state, so leaving it lit on a box that is no longer
+REM  stopped is worse than not clearing anything.
+IF EXIST C:\TOOLS\SCRLOFF.COM C:\TOOLS\SCRLOFF.COM
 ECHO.
 ECHO ===================================================================
 ECHO  Agent stopped. Nothing is polling now, so dosctl on the Windows
 ECHO  side cannot reach this machine until it is running again.
 ECHO.
-ECHO   jobs from   : %SRV%
-ECHO   results to  : %UPHOST% port 8081
+ECHO   jobs from   : %UPHOST% port 8069
+ECHO   results to  : %UPHOST% port 8069
 IF NOT "%MTCPCFG%"=="" GOTO QIP
 ECHO   own address : MTCPCFG is not set
 GOTO QIPDONE
@@ -171,7 +281,8 @@ GOTO QIPDONE
 IF EXIST %MTCPCFG% FIND "IPADDR" %MTCPCFG%
 :QIPDONE
 ECHO.
-ECHO  If ScrollLock stopped it, turn ScrollLock OFF or it will stop again.
+IF EXIST C:\TOOLS\SCRLOFF.COM ECHO  ScrollLock has been cleared for you.
+IF NOT EXIST C:\TOOLS\SCRLOFF.COM ECHO  Turn ScrollLock OFF, or it stops again.
 ECHO  Then type  C:\AI\AI.BAT  to restart. Rebooting also restarts it.
 ECHO ===================================================================
 ECHO.

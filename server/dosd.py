@@ -4,38 +4,52 @@ DOS Bridge  --  StevenC
 
 dosd - job server bridging a Windows dev box to a real DOS machine over WiFi.
 
-Runs on Windows 11. The DOS box polls it for work over HTTP (mTCP HTGET) and
-posts results back over a raw TCP socket (mTCP NC).
+Runs on Windows. The DOS box polls it for work over TFTP and sends results
+back the same way, using the bridge's own IPv4/UDP stack -- no mTCP anywhere.
 
-  port 8080  HTTP   /job          long-poll, returns a JOB.BAT for DOS to CALL
-                    /f/<name>     serves files from ./files
-                    /queue        (CLI) queue a job, returns job id
+  port 8069  UDP    TFTP. THE transport: job polls, file fetches, results,
+                    and `dosctl pull`. Reserved names `job`, `result`, `pull`;
+                    `name@<offset>` resumes a stalled transfer from a byte
+                    offset; RFC 2348 blksize is negotiated up to 1400
+  port 8080  HTTP   /queue        (CLI) queue a job, returns job id
                     /result/<id>  (CLI) long-poll for that job's result
                     /status       (CLI) health / last-seen-boot info
-  port 8081  raw    result intake from NC (text; parses ##JOB=/##RC= framing)
-  port 8082  raw    binary intake from NC for `dosctl pull` -- no decoding at
-                    all, so files come back byte-exact
+                    /shutdown     (CLI, loopback only) stop the daemon
+                    /job, /f/     legacy DOS-side paths, kept for an old agent
+  port 8081  raw    legacy result intake (text; parses ##JOB=/##RC= framing)
+  port 8082  raw    legacy binary intake for `dosctl pull`
+
+The three legacy listeners cost one idle socket each and are the only way
+bytes could still arrive from a box running a batch an older dosd generated.
+Nothing this version emits uses them.
 
 Start it once and leave it running:  python dosd.py
 """
 
 import base64
+import io
 import json
 import os
 import re
 import queue
 import socket
 import socketserver
+import struct
 import sys
 import threading
 import time
 import uuid
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
 
 HTTP_PORT = 8080
 RESULT_PORT = 8081
 PULL_PORT = 8082
+# TFTP, the UDP replacement for HTGET and NC. 69 is the real TFTP port
+# but binding it needs privilege on most systems, and nothing else here
+# is privileged -- so it sits with the bridge's other ports instead.
+TFTP_PORT = 8069
 FILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "files")
 
 # A staged file is referenced as either NAME (the serving root -- EXIT0.COM and
@@ -96,7 +110,33 @@ def leaf_of(rel):
 
 # How long /job holds a connection open before returning an idle response.
 # Keep this well under mTCP's socket timeout so HTGET never gives up on us.
-POLL_HOLD_SECS = 8
+# How long a job request is held open before answering "nothing for you".
+#
+# This is the single number that decides whether an idle poll gets an answer
+# at all, and it is not obvious why. Each poll begins with the DOS box ARPing
+# for us, which is what puts this host's ARP entry for the box into a state it
+# can actually send to. We then sit on the request. Answer 8 seconds later and
+# that entry may have gone stale -- and nothing on the box answers the re-probe,
+# because by then `Net` has released the 0806 handle and holds only 0800. The
+# reply is simply undeliverable. Answer at 2 seconds and it is still fresh.
+#
+# Measured on hardware 2026-09-02, four minutes of idle polling each way:
+#
+#     hold = 8s    24 polls,  4 unacked   (17%)
+#     hold = 2s    30 polls,  1 unacked   (3.3%)
+#
+# The 3.3% left over is just this WiFi link -- it matches the loss measured
+# with 30 pings -- so what the long hold was costing was five sixths of the
+# failures, all of it self-inflicted.
+#
+# The cost is polls every ~6 seconds instead of ~11, which is nothing on a
+# LAN and was checked with the owner of this one. A wired box loses less to
+# begin with and pays even less for the shorter hold. Raise it with
+# DOSD_POLL_HOLD if a link ever makes the chatter matter more than the misses.
+#
+# Careful: this used to read TFTP_HOLD_SECS in one place and POLL_HOLD_SECS in
+# another. Only this one is live -- see the note on TFTP_HOLD_SECS.
+POLL_HOLD_SECS = float(os.environ.get("DOSD_POLL_HOLD", "2"))
 
 # Max errorlevel we bother to capture. DOS 6.22 has no way to read ERRORLEVEL
 # into a variable, so the generated batch tests each value in turn.
@@ -211,7 +251,315 @@ def errorlevel_capture():
     return lines
 
 
-def build_run_batch(job_id, exe_name, args, reboot_after, cold):
+
+# ---------------------------------------------------------------------------
+# Transport for the generated batches: our own UDP, and nothing else.
+#
+# There is no mTCP fallback any more. There was one while the UDP stack was
+# being trusted -- every transfer tried UGET/UPUT and dropped to HTGET/NC on
+# failure -- and it was removed on 2026-09-02 along with the last mTCP call,
+# because keeping it meant every kit still had to ship with mTCP, which was
+# the whole reason for moving off it.
+#
+# What replaced it is retry inside the transport: UGET resends a lost request
+# and a lost block itself, and rebuilds the flow outright if one stalls. So a
+# dropped packet costs a moment rather than falling through to a second
+# protocol. See `starter/tftp.pas`.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Breadcrumbs, for finding out where the box was when it froze.
+#
+# The machine has hung four times in a day with nothing to show for it: the
+# console's last line is whatever finished BEFORE the hang, so all it says is
+# "not there yet". This is the same trick dosdrv already uses to survive a
+# driver that wedges the machine -- write a marker to disk, then read it back
+# on the next boot -- applied to the ordinary job path.
+#
+# APPEND, not overwrite. The obvious design writes one word to PHASE.TXT and
+# reads it after a reboot, and it cannot work: reading the file needs a job,
+# and that job's own batch overwrites the marker before the pull runs. An
+# append-only log keeps the frozen job's last line underneath whatever the
+# recovery job adds.
+#
+# ECHO opens, writes and closes, so each line is committed to disk before the
+# next command starts. That is the property this depends on -- a buffered
+# write would be lost in exactly the case it exists for.
+#
+# DOSD_PHASE=0 turns it off. It costs a file open/write/close per phase, and
+# if that ever becomes a suspect itself, it has to be possible to remove it
+# without redeploying the agent.
+PHASE_LOG = "C:\\AGENT\\PHASE.LOG"
+PHASE_ON = os.environ.get("DOSD_PHASE", "1").lower() not in ("0", "no", "off")
+
+
+def phase(job_id, tag):
+    """Batch line recording that the box reached `tag`. Possibly none."""
+    if not PHASE_ON:
+        return []
+    # No ">" and no "%" in the tag: COMMAND.COM cannot escape a redirection
+    # inside an ECHO, and would read one as a second redirect.
+    clean = "".join(c for c in tag if c not in ">%<|")[:24]
+    return ["ECHO %s %s >> %s" % (job_id[:4], clean, PHASE_LOG)]
+
+
+HD_DOS   = "C:\\TOOLS\\HD.EXE"   # the checksum tool a deploy verifies with
+UGET_DOS = "C:\\TOOLS\\UGET.EXE"
+UPUT_DOS = "C:\\TOOLS\\UPUT.EXE"
+
+
+def fetch_lines(name, dest, job_id="----"):
+    """Batch lines that put the served file `name` at `dest` on the DOS box.
+
+    No mTCP fallback any more. UGET retransmits a lost request and a lost
+    block on its own, so the fallback was only ever covering a bug in our own
+    stack -- and keeping it meant every kit still had to ship with mTCP,
+    which was the whole reason for moving off it.
+
+    The caller tests for `dest`, not for an exit code. UGET's exit code is
+    honest, but the file test also catches a tool that is missing entirely.
+    """
+    return phase(job_id, "fetch " + leaf_of(name)) + [
+        "IF EXIST %s DEL %s" % (dest, dest),
+        UGET_DOS + " %UPHOST% " + name + " " + dest,
+    ] + phase(job_id, "got " + leaf_of(name))
+
+
+def send_result_lines(tag, job_id="----"):
+    r"""Batch lines that return C:\WORK\RES.TXT to the server.
+
+    One line now that mTCP is gone -- the labels only existed to branch
+    around the NC fallback. `tag` is kept in the signature so the call sites
+    do not all have to change, and so a future fallback has somewhere to go.
+    """
+    return phase(job_id, "send") + [
+        UPUT_DOS + " %UPHOST% C:\\WORK\\RES.TXT result",
+    ]
+
+
+
+# ---------------------------------------------------------------------------
+# What the DOS console shows for each job.
+#
+# The agent's boot banner now stays on screen permanently, so everything below
+# it is a running status display rather than a scrollback. That only works if
+# every line fits: the screen is 80 columns and a line that wraps costs two
+# rows and reads as damage. So each job gets exactly two short lines -- what
+# it is, and how it ended -- and both are truncated to fit.
+#
+# The job id is cut to four characters. That is plenty to match a line on the
+# screen against a line in dosd's log, and the full id would eat a tenth of
+# the width for no benefit anyone standing at the machine cares about.
+# ---------------------------------------------------------------------------
+
+CONSOLE_COLS = 78
+
+
+def job_head(job_id, what):
+    return "ECHO " + ("[%s] %s" % (job_id[:4], what))[:CONSOLE_COLS]
+
+
+def job_foot(job_id, what):
+    return "ECHO " + ("[%s]   %s" % (job_id[:4], what))[:CONSOLE_COLS]
+
+
+
+# COMMAND.COM's internal commands never touch ERRORLEVEL, so a job made only
+# of those reports a number that means nothing: DIR C:\NOSUCH exits 0, and
+# EXIT0.COM has already forced the ladder to read a clean 0. The result sent
+# back to Windows still carries ##RC either way -- that is dosctl's contract
+# and dosexec's documented caveat -- but the console is read by somebody
+# standing at the machine with no way to know that, so it says "done" rather
+# than inventing an authoritative-looking "rc 0" for them to trust.
+#
+# IF and FOR are deliberately NOT in this set. Either can invoke an external
+# program, so their rc may well be real. Printing a possibly-stale number is
+# the status quo and merely unhelpful; printing "done" over a program that
+# actually failed would hide a failure. The doubt resolves towards the number.
+INTERNAL_CMDS = frozenset("""
+    break call cd chcp chdir cls copy ctty date del dir echo erase exit
+    goto lh loadhigh md mkdir path pause prompt rd rem ren rename rmdir
+    set shift time truename type ver verify vol
+""".split())
+
+
+def sets_errorlevel(cmd):
+    """Can this command line leave a meaningful ERRORLEVEL behind?"""
+    tok = cmd.strip().split()
+    if not tok:
+        return False
+    word = tok[0].split("\\")[-1]          # C:\TOOLS\FPU.EXE -> FPU.EXE
+    if "." in word:
+        word = word.rsplit(".", 1)[0]        # FPU.EXE -> FPU
+    return word.lower() not in INTERNAL_CMDS
+
+
+# The marker a batch writes when a command names a program that is not on
+# the disk. It travels back inside the captured output, because that is the
+# one channel a job already has; dosctl lifts it out again.
+NOEXEC_MARK = "##NOEXEC="
+
+_EXE_SUFFIX = (".exe", ".com", ".bat")
+
+
+def explicit_program(cmd):
+    r"""The program a command names, but only when that is beyond doubt.
+
+    Returns e.g. "C:\BAD.EXE" for `C:\BAD.EXE /x`, and None for anything
+    whose existence this cannot test honestly.
+
+    The rule is deliberately narrow: an explicit path (it has a backslash or a
+    drive letter) AND an executable extension. Both halves matter.
+
+    * Without the path requirement, `FOO.EXE` would be checked with IF EXIST,
+      which searches only the current directory -- so every tool resolved
+      through PATH would be reported missing. A false "not found" on a command
+      that works is far worse than the silence this replaces.
+    * Without the extension requirement, `C:\TOOLS\FPU` would be reported
+      missing even though COMMAND.COM would happily find FPU.EXE for it.
+
+    Narrow is the right shape here because the case that actually bites is the
+    explicit path: C:\TOOLS is not on the box's PATH, so the documented way to
+    call every tool in the kit is by full path, and a typo in one of those is
+    exactly what goes silent today.
+    """
+    tok = cmd.strip().split()
+    if not tok:
+        return None
+    prog = tok[0]
+    if not prog.lower().endswith(_EXE_SUFFIX):
+        return None
+    if "\\" not in prog and ":" not in prog:
+        return None
+    return prog
+
+
+def noexec_guard(cmd):
+    """Batch lines that flag `cmd` if its program is missing. Possibly none.
+
+    This exists because a missing program is otherwise *completely* invisible
+    from Windows. COMMAND.COM writes "Bad command or file name" to a console
+    this bridge cannot capture -- 6.22 has no stderr redirection at all -- and
+    it leaves ERRORLEVEL alone, which EXIT0.COM has just forced to 0. So the
+    job comes back with no output and rc 0: a confident success for a program
+    that never ran.
+    """
+    prog = explicit_program(cmd)
+    if not prog:
+        return []
+    # One IF with an internal command (ECHO), so the chained-IF trap does not
+    # apply. No ">" inside the ECHO text either -- COMMAND.COM cannot escape
+    # one, and it would be read as a second redirection.
+    return ["IF NOT EXIST %s ECHO %s%s >> C:\\WORK\\OUT.TXT"
+            % (prog, NOEXEC_MARK, prog)]
+
+
+def job_rc_lines(job_id, meaningful=True, tag="FR"):
+    """The footer's second line -- how the job ended -- as ECHO statements.
+
+    Success and failure occupy the same single row: the point is that a
+    failure is legible from across the room, not that it is longer. A column
+    of identical "rc 0" lines hides the one "rc 3" in it; "ok" against
+    "rc 3 FAILED" does not.
+
+    Two separate IFs rather than one chained pair, because COMMAND.COM 6.22
+    silently drops the second half of a chained IF when the command is
+    external. ECHO is internal so it would survive here, but that is not a
+    rule worth relearning the hard way in a batch nobody can debug.
+    """
+    if not meaningful:
+        return timed_foot(job_id, [(None, "done")], tag)
+    return timed_foot(job_id, [
+        ('IF "%RC%"=="0" ', "ok"),
+        ('IF NOT "%RC%"=="0" ', "rc %RC% FAILED"),
+    ], tag)
+
+
+
+ELAPSED_DOS = "C:\\TOOLS\\ELAPSED.COM"
+
+
+OUT_DOS = "C:\\WORK\\OUT.TXT"
+
+# Whether a job's captured output is also dumped on the DOS console.
+#
+# On by default: the machine standing in front of you should be able to show
+# what it just did, not only what it was asked to do. The result still goes
+# back over the wire either way -- this is a second copy for the screen.
+#
+# It is the one thing here that deliberately breaks the two-lines-per-job
+# budget, and it does scroll the boot banner away sooner. That is the trade
+# for being able to read a job's output at the machine, and it is per-job
+# reversible: `dosrun --quiet`, `dosexec --quiet`, or DOSD_ECHO_OUTPUT=0 to
+# flip the default for a whole session. dosctl's own bookkeeping jobs (the
+# version TYPE, the C:\TOOLS listing, the stop flag) always pass echo=False,
+# because a 36-file DIR on the console every upgrade is nobody's idea of a
+# status display.
+ECHO_OUTPUT = os.environ.get("DOSD_ECHO_OUTPUT", "1").lower() \
+    not in ("0", "no", "off", "false")
+
+
+def echo_output_lines(echo=None):
+    """TYPE the captured output onto the console, unredirected.
+
+    Sits between the head line and the footer, so a job reads as: what it is,
+    what it said, how it ended. The footer's elapsed time therefore includes
+    this dump -- which is honest, since it is work the box really did.
+    """
+    if echo is None:
+        echo = ECHO_OUTPUT
+    if not echo:
+        return []
+    return ["IF EXIST %s TYPE %s" % (OUT_DOS, OUT_DOS)]
+
+
+def stash_time():
+    """Start the job stopwatch.
+
+    Goes immediately after the head line, so the time a job reports is the
+    whole job -- fetch included -- and not just the program. That is the
+    number somebody standing at the machine is asking about.
+
+    One IF with an external command is fine; it is a *chained* IF that
+    COMMAND.COM 6.22 silently drops when the command is external.
+    """
+    return ["IF EXIST %s %s /S" % (ELAPSED_DOS, ELAPSED_DOS)]
+
+
+def timed_foot(job_id, alts, tag):
+    """A footer that carries how long the job took.
+
+    `alts` is a list of (if-prefix or None, text) -- more than one because
+    the choice between "ok" and "rc 3 FAILED" has to be made on the DOS side.
+
+    ELAPSED.COM prints the caller's text and appends the time, rather than
+    just printing a number, because the footer has to stay ONE row: ECHO
+    always terminates its line, so nothing can be appended to a row ECHO
+    printed. See starter/elapsed.asm.
+
+    The whole group is guarded on the tool existing, and falls back to plain
+    ECHO. A box that has not had `dosctl upgrade --tools` run against it then
+    still gets its footer -- without the time -- instead of a "Bad command or
+    file name" where the status line should be.
+
+    The guard is a GOTO rather than `SET F=ECHO` and `%F%`, which would be
+    two lines instead of seven. The environment on this box is nearly full,
+    and a SET that failed with "Out of environment space" would expand to
+    nothing and leave COMMAND.COM trying to execute the footer text itself.
+    """
+    body, plain = [], []
+    for prefix, text in alts:
+        line = ("[%s]   %s" % (job_id[:4], text))[:CONSOLE_COLS]
+        body.append((prefix or "") + ELAPSED_DOS + " " + line)
+        plain.append((prefix or "") + "ECHO " + line)
+    return (["IF NOT EXIST %s GOTO N%s" % (ELAPSED_DOS, tag)]
+            + body
+            + ["GOTO D%s" % tag, ":N%s" % tag]
+            + plain
+            + [":D%s" % tag])
+
+
+def build_run_batch(job_id, exe_name, args, reboot_after, cold, echo=None):
     """A job that fetches an .EXE/.COM, runs it, and ships stdout back."""
     # exe_name is the staged reference (NAME or PROJECT/NAME). The DOS box only
     # ever sees the leaf, because C:\WORK is flat. That stays safe despite the
@@ -223,25 +571,28 @@ def build_run_batch(job_id, exe_name, args, reboot_after, cold):
         cmd += " " + args
     lines = [
         "@ECHO OFF",
-        "ECHO [dosd] job %s: %s" % (job_id, exe_name),
-        "IF EXIST C:\\WORK\\%s DEL C:\\WORK\\%s" % (exe, exe),
-        "HTGET -o C:\\WORK\\%s http://%%SRV%%/f/%s > NUL" % (exe, exe_name),
+        job_head(job_id, "run " + exe_name + (" " + args if args else "")),
+    ] + stash_time() + fetch_lines(exe_name, "C:\\WORK\\" + exe, job_id) + [
         "IF NOT EXIST C:\\WORK\\%s GOTO NOFILE" % exe,
         "IF EXIST C:\\WORK\\OUT.TXT DEL C:\\WORK\\OUT.TXT",
+    ] + phase(job_id, "run " + exe) + [
         cmd + " > C:\\WORK\\OUT.TXT",
+    ] + phase(job_id, "ran " + exe) + [
     ]
     lines += errorlevel_capture()
     lines += [
         "ECHO ##JOB=%s > C:\\WORK\\RES.TXT" % job_id,
         "IF EXIST C:\\WORK\\OUT.TXT TYPE C:\\WORK\\OUT.TXT >> C:\\WORK\\RES.TXT",
         "ECHO ##RC=%RC% >> C:\\WORK\\RES.TXT",
-        "NC -target %UPHOST% " + str(RESULT_PORT) + " < C:\\WORK\\RES.TXT > NUL",
+    ] + echo_output_lines(echo) + job_rc_lines(job_id) + [
+        UPUT_DOS + " %UPHOST% C:\\WORK\\RES.TXT result",
         "GOTO END",
         ":NOFILE",
+        job_foot(job_id, "FAILED - could not fetch " + leaf_of(exe_name)),
         "ECHO ##JOB=%s > C:\\WORK\\RES.TXT" % job_id,
         "ECHO dosd: download of %s failed >> C:\\WORK\\RES.TXT" % exe_name,
         "ECHO ##RC=254 >> C:\\WORK\\RES.TXT",
-        "NC -target %UPHOST% " + str(RESULT_PORT) + " < C:\\WORK\\RES.TXT > NUL",
+        UPUT_DOS + " %UPHOST% C:\\WORK\\RES.TXT result",
         ":END",
     ]
     if reboot_after:
@@ -289,12 +640,10 @@ def build_driver_batch(job_id, drv_name, drv_args, cold, device=None):
 
     lines = [
         "@ECHO OFF",
-        "ECHO [dosd] job %s: staging driver %s" % (job_id, drv_name),
-        "IF EXIST C:\\WORK\\%s DEL C:\\WORK\\%s" % (drv, drv),
-        "HTGET -o C:\\WORK\\%s http://%%SRV%%/f/%s > NUL" % (drv, drv_name),
+        job_head(job_id, "driver " + leaf_of(drv_name) + " - will reboot"),
+    ] + fetch_lines(drv_name, "C:\\WORK\\" + drv, job_id) + [
         "IF NOT EXIST C:\\WORK\\%s GOTO NOFILE" % drv,
-        "IF EXIST C:\\AGENT\\PEND.BAT DEL C:\\AGENT\\PEND.BAT",
-        "HTGET -o C:\\AGENT\\PEND.BAT http://%SRV%/f/PEND.BAT > NUL",
+    ] + fetch_lines("PEND.BAT", "C:\\AGENT\\PEND.BAT", job_id) + [
         "IF NOT EXIST C:\\AGENT\\PEND.BAT GOTO NOFILE",
         "ECHO ##JOB=%s > C:\\AGENT\\PENDID.TXT" % job_id,
         "COLDBOOT.COM" if cold else "REBOOT.COM",
@@ -303,7 +652,7 @@ def build_driver_batch(job_id, drv_name, drv_args, cold, device=None):
         "ECHO ##JOB=%s > C:\\WORK\\RES.TXT" % job_id,
         "ECHO dosd: download of %s failed >> C:\\WORK\\RES.TXT" % drv_name,
         "ECHO ##RC=254 >> C:\\WORK\\RES.TXT",
-        "NC -target %UPHOST% " + str(RESULT_PORT) + " < C:\\WORK\\RES.TXT > NUL",
+        UPUT_DOS + " %UPHOST% C:\\WORK\\RES.TXT result",
         ":END",
     ]
     return lines
@@ -313,92 +662,229 @@ def build_pull_batch(job_id, remote_path):
     """
     Ship a file off the DOS box byte-exact.
 
-    NC reads the file itself, so this never passes through TYPE and is immune
-    to the 0x1A (Ctrl-Z) truncation that makes `dosexec "TYPE ..."` useless for
-    binaries. The bytes land on PULL_PORT, which does no decoding and no
-    line-ending normalisation at all.
+    UPUT reads the file itself, so this never passes through TYPE and is
+    immune to the 0x1A (Ctrl-Z) truncation that makes `dosexec "TYPE ..."`
+    useless for binaries. TFTP is a block protocol with a byte count, so
+    there is no text mode to get wrong and nothing to opt out of.
 
-    `-bin` is load-bearing and must not be dropped. Without it NC opens stdin
-    in text mode and silently eats every 0x0D and 0x1A on the way out: a 27298
-    byte SYSINFO.EXE arrived as 27258, corrupt but plausible-looking. Measured
-    on a 5-byte probe containing both, plain NC delivered 3 bytes and `NC -bin`
-    delivered 5.
+    This was mTCP's `NC -bin` until 2026-09-02, and dropping it took the last
+    mTCP call out of every generated batch. Two reasons it had to go, beyond
+    the dependency. `NC` printed a thirteen-line version banner **straight to
+    the console** on every pull -- `> NUL` was already there and made no
+    difference, because COMMAND.COM 6.22 has no stderr redirection at all, so
+    it could not be silenced from a batch. And `-bin` was load-bearing in a
+    way nothing on the wire enforced: without it NC opened stdin in text mode
+    and silently ate every 0x0D and 0x1A, so a 27298-byte SYSINFO.EXE arrived
+    as 27258 -- corrupt but entirely plausible-looking.
+
+    The bytes now arrive on TFTP_PORT under the reserved name `pull` and land
+    in the same sink, so `dosctl pull` is unchanged.
 
     Only the not-found path reports on RESULT_PORT; a successful transfer is
     signalled by the bytes themselves arriving.
     """
     return [
         "@ECHO OFF",
-        "ECHO [dosd] job %s: pull %s" % (job_id, remote_path),
+        job_head(job_id, "pull " + remote_path),
+    ] + stash_time() + [
         "IF NOT EXIST %s GOTO NOFILE" % remote_path,
-        "NC -bin -target %UPHOST% " + str(PULL_PORT)
-        + " < " + remote_path + " > NUL",
+        UPUT_DOS + " %UPHOST% " + remote_path + " pull",
+        "IF ERRORLEVEL 1 GOTO SENDFAIL",
+    ] + timed_foot(job_id, [(None, "sent")], "FP") + [
+        "GOTO END",
+        ":SENDFAIL",
+        job_foot(job_id, "FAILED - upload"),
+        "ECHO ##JOB=%s > C:\\WORK\\RES.TXT" % job_id,
+        "ECHO dosd: upload of %s from the DOS box failed >> C:\\WORK\\RES.TXT" % remote_path,
+        "ECHO ##RC=254 >> C:\\WORK\\RES.TXT",
+    ] + send_result_lines("pullfail") + [
         "GOTO END",
         ":NOFILE",
+        job_foot(job_id, "FAILED - not found"),
         "ECHO ##JOB=%s > C:\\WORK\\RES.TXT" % job_id,
         "ECHO dosd: %s not found on the DOS box >> C:\\WORK\\RES.TXT" % remote_path,
         "ECHO ##RC=254 >> C:\\WORK\\RES.TXT",
-        "NC -target %UPHOST% " + str(RESULT_PORT) + " < C:\\WORK\\RES.TXT > NUL",
+        UPUT_DOS + " %UPHOST% C:\\WORK\\RES.TXT result",
         ":END",
     ]
+
+
+
+def verify_then_install(name, dest):
+    r"""Check the download's CRC-32 on the box, then swap it into place.
+
+    This exists because of 2026-09-02, when a deploy of UGET.EXE fetched the
+    file, wrote a corrupt copy over C:\TOOLS\UGET.EXE and stranded the
+    machine. The batch tested `IF EXIST` and nothing else -- so a truncated or
+    half-written download passed the guard and was installed over the one
+    binary the agent cannot poll without. Recovering it took hands on the
+    keyboard, because the mTCP fallback had been removed the same day.
+
+    Two guards, in the order that matters:
+
+    * **Verify before installing.** `HD` on the box prints the same CRC-32 as
+      Python's zlib.crc32, and `FIND` sets ERRORLEVEL 1 when the expected
+      value is absent -- so the box can check its own download against a
+      number computed here, with no new tool and no arithmetic in batch. A
+      mismatch leaves the existing file untouched.
+    * **Keep the outgoing copy.** The previous binary is kept alongside as
+      .BAK, so recovery is one COPY at the keyboard rather than a hand-typed
+      HTGET against a URL. Same reasoning as C:\AI\AI.BAK for the agent.
+
+    A box with no HD.EXE yet -- a fresh install -- skips the checksum and
+    falls back to the existence test, because refusing to deploy the tools
+    onto a machine that has none of them would be a fine way to make the
+    installer unusable.
+    """
+    rel = safe_rel(name)
+    src = rel_to_path(rel) if rel else None
+    want = None
+    if src and os.path.isfile(src):
+        with open(src, "rb") as fh:
+            want = "%08X" % (zlib.crc32(fh.read()) & 0xFFFFFFFF)
+
+    bak = dest.rsplit(".", 1)[0] + ".BAK" if "." in dest.rsplit(
+        chr(92), 1)[-1] else dest + ".BAK"
+
+    lines = []
+    if want:
+        lines += [
+            "IF NOT EXIST %s GOTO NOCRC" % HD_DOS,
+            "IF EXIST C:\\WORK\\CRC.TXT DEL C:\\WORK\\CRC.TXT",
+            "%s C:\\WORK\\DEPLOY.TMP 0 1 > C:\\WORK\\CRC.TXT" % HD_DOS,
+            'FIND "%s" C:\\WORK\\CRC.TXT > NUL' % want,
+            "IF ERRORLEVEL 1 GOTO BADCRC",
+            ":NOCRC",
+        ]
+    lines += [
+        "IF EXIST %s COPY %s %s > NUL" % (dest, dest, bak),
+        "COPY C:\\WORK\\DEPLOY.TMP %s > NUL" % dest,
+        "DEL C:\\WORK\\DEPLOY.TMP",
+    ]
+    return lines
 
 
 def build_deploy_batch(job_id, name, dest_dir):
     """
     Fetch a staged file onto the DOS box and confirm it actually landed.
 
-    HTGET exits >= 20 even on success, so its errorlevel is worthless as a
-    signal -- IF EXIST is the only trustworthy check.
+    The exit code of the fetch is not the check. That began as a workaround
+    for HTGET, which exited >= 20 even on success; UGET's code is honest, but
+    IF EXIST is still what runs, because it also catches the tool being absent
+    altogether -- which an exit code cannot distinguish from a clean failure.
+
+    Note IF EXIST is not sufficient on its own either: a transfer truncated to
+    exactly the right length passes it. `dosctl deploy` follows up with a
+    CRC-32 from HD.EXE, which is the check that actually means something.
     """
     dest = dest_dir.rstrip("\\") + "\\" + leaf_of(name)
     return [
         "@ECHO OFF",
-        "ECHO [dosd] job %s: deploy %s -> %s" % (job_id, name, dest),
-        "IF EXIST %s DEL %s" % (dest, dest),
-        "HTGET -o %s http://%%SRV%%/f/%s > NUL" % (dest, name),
+        # "to", never "->". COMMAND.COM cannot escape a > inside an ECHO,
+        # so "-> C:\TOOLS\UGET.EXE" is parsed as a REDIRECT and writes the
+        # announce text straight into the destination file. That silently
+        # truncated every deploy target to ~48 bytes for as long as this line
+        # has existed -- invisible, because the download that followed
+        # immediately overwrote it. It stopped being invisible when the
+        # destination became the tool doing the downloading: the ECHO
+        # clobbered C:\TOOLS\UGET.EXE, the next line executed those 48 bytes
+        # as a program, and the machine needed a power cycle.
+        job_head(job_id, "deploy %s to %s" % (leaf_of(name), dest_dir)),
+    ] + stash_time() + [
+        # Fetch to a scratch name and COPY into place, rather than deleting
+        # the destination and downloading over it.
+        #
+        # Two reasons, and the first one bit hard. Deploying UGET.EXE itself
+        # DELETED C:\TOOLS\UGET.EXE and then tried to run it to do the
+        # download -- a tool cannot replace itself that way, any more than
+        # AI.BAT can overwrite itself while COMMAND.COM is reading it. The
+        # box survived only because the agent still had an mTCP fallback for
+        # its poll, and recovering needed HTGET to put the file back.
+        #
+        # Second: a download that fails now leaves the existing file alone
+        # instead of destroying it. The old order deleted first and asked
+        # questions later.
+        "IF EXIST C:\\WORK\\DEPLOY.TMP DEL C:\\WORK\\DEPLOY.TMP",
+        UGET_DOS + " %UPHOST% " + name + " C:\\WORK\\DEPLOY.TMP",
+        "IF NOT EXIST C:\\WORK\\DEPLOY.TMP GOTO NOFILE",
+    ] + verify_then_install(name, dest) + [
         "IF NOT EXIST %s GOTO NOFILE" % dest,
         "ECHO ##JOB=%s > C:\\WORK\\RES.TXT" % job_id,
         "DIR %s >> C:\\WORK\\RES.TXT" % dest,
         "ECHO ##RC=0 >> C:\\WORK\\RES.TXT",
-        "NC -target %UPHOST% " + str(RESULT_PORT) + " < C:\\WORK\\RES.TXT > NUL",
+    ] + timed_foot(job_id, [(None, "ok")], "FD") + [
+        UPUT_DOS + " %UPHOST% C:\\WORK\\RES.TXT result",
+        "GOTO END",
+        ":BADCRC",
+        job_foot(job_id, "FAILED - bad checksum, NOT installed"),
+        "ECHO ##JOB=%s > C:\\WORK\\RES.TXT" % job_id,
+        "ECHO dosd: %s arrived corrupt; the old copy was left in place"
+        " >> C:\\WORK\\RES.TXT" % name,
+        "ECHO ##RC=254 >> C:\\WORK\\RES.TXT",
+    ] + send_result_lines("badcrc") + [
         "GOTO END",
         ":NOFILE",
+        job_foot(job_id, "FAILED - download"),
         "ECHO ##JOB=%s > C:\\WORK\\RES.TXT" % job_id,
         "ECHO dosd: download of %s failed >> C:\\WORK\\RES.TXT" % name,
         "ECHO ##RC=254 >> C:\\WORK\\RES.TXT",
-        "NC -target %UPHOST% " + str(RESULT_PORT) + " < C:\\WORK\\RES.TXT > NUL",
+        UPUT_DOS + " %UPHOST% C:\\WORK\\RES.TXT result",
         ":END",
     ]
 
 
-def build_raw_batch(job_id, body_lines):
+def build_raw_batch(job_id, body_lines, echo=None):
     """
     Arbitrary DOS commands, with output captured and returned.
 
     EXIT0.COM runs immediately before the caller's commands to force ERRORLEVEL
     to a known 0. Without it the ladder below reads a stale value: DOS internal
     commands (ECHO, VER, DIR, IF, DEL, TYPE) never touch ERRORLEVEL, so a list
-    made only of those reports whatever the last *external* program left behind
-    -- in practice the HTGET that fetched this JOB.BAT, which exits high enough
-    to pin the ladder at MAX_ERRORLEVEL. If the fetch fails we degrade to that
-    old stale-value behaviour rather than breaking the job.
+    made only of those reports whatever the last *external* program left
+    behind -- in practice the UGET that fetched this JOB.BAT. If the fetch of
+    EXIT0.COM itself fails we degrade to that stale-value behaviour rather
+    than breaking the job.
     """
     lines = [
         "@ECHO OFF",
-        "IF NOT EXIST C:\\AGENT\\EXIT0.COM HTGET -o C:\\AGENT\\EXIT0.COM "
-        "http://%SRV%/f/EXIT0.COM > NUL",
+        # Raw jobs used to run in complete silence, which made the console
+        # useless for telling "busy" from "wedged". The other builders always
+        # announced themselves; this one now does too.
+        job_head(job_id, "exec %d cmd(s): %s"
+                 % (len(body_lines), body_lines[0] if body_lines else "")),
+    ] + stash_time() + [
+        # One IF, one external command. NOT "IF NOT EXIST ... UGET ..."
+        # chained with another IF: COMMAND.COM 6.22 honours a chained IF
+        # when the command is INTERNAL and silently drops it when it is
+        # EXTERNAL, so the chained form would never fetch anything.
+        "IF EXIST C:\\AGENT\\EXIT0.COM GOTO HAVE0",
+        UGET_DOS + " %UPHOST% EXIT0.COM C:\\AGENT\\EXIT0.COM",
+        ":HAVE0",
         "IF EXIST C:\\WORK\\OUT.TXT DEL C:\\WORK\\OUT.TXT",
         "IF EXIST C:\\AGENT\\EXIT0.COM C:\\AGENT\\EXIT0.COM",
     ]
-    for c in body_lines:
+    for ci, c in enumerate(body_lines):
+        # Checked immediately before the command rather than all at the top,
+        # so a program an earlier command in the same job creates is judged
+        # at the moment it is actually invoked.
+        lines += noexec_guard(c)
+        # One breadcrumb per command, not per job. A `dosexec` that sticks
+        # needs to say WHICH command it stuck on, and an exec job is the
+        # one shape where the commands are arbitrary.
+        lines += phase(job_id, "cmd%d %s" % (ci, leaf_of(c.split()[0])
+                                             if c.split() else "?"))
         lines.append("%s >> C:\\WORK\\OUT.TXT" % c)
+    lines += phase(job_id, "cmds done")
     lines += errorlevel_capture()
     lines += [
         "ECHO ##JOB=%s > C:\\WORK\\RES.TXT" % job_id,
         "IF EXIST C:\\WORK\\OUT.TXT TYPE C:\\WORK\\OUT.TXT >> C:\\WORK\\RES.TXT",
         "ECHO ##RC=%RC% >> C:\\WORK\\RES.TXT",
-        "NC -target %UPHOST% " + str(RESULT_PORT) + " < C:\\WORK\\RES.TXT > NUL",
-    ]
+    ] + echo_output_lines(echo) + job_rc_lines(
+        job_id, bool(body_lines) and sets_errorlevel(body_lines[-1]),
+        tag="FX") + phase(job_id, "send") + [
+        UPUT_DOS + " %UPHOST% C:\\WORK\\RES.TXT result",
+    ] + phase(job_id, "sent")
     return lines
 
 
@@ -438,9 +924,8 @@ def build_agent_batch(job_id, name):
     exe = leaf_of(name)
     return [
         "@ECHO OFF",
-        "ECHO [dosd] job %s: agent upgrade" % job_id,
-        "IF EXIST C:\\AGENT\\AINEW.BAT DEL C:\\AGENT\\AINEW.BAT",
-        "HTGET -o C:\\AGENT\\AINEW.BAT http://%%SRV%%/f/%s > NUL" % name,
+        job_head(job_id, "agent upgrade - will reboot"),
+    ] + fetch_lines(name, "C:\\AGENT\\AINEW.BAT", job_id) + [
         "IF NOT EXIST C:\\AGENT\\AINEW.BAT GOTO NOFILE",
         'FIND "%s" C:\\AGENT\\AINEW.BAT > NUL' % AGENT_END,
         "IF ERRORLEVEL 1 GOTO TRUNC",
@@ -452,7 +937,7 @@ def build_agent_batch(job_id, name):
         "ECHO ##AGENT swapped from %s, previous kept as C:\\AI\\AI.BAK"
         " >> C:\\WORK\\RES.TXT" % exe,
         "ECHO ##RC=0 >> C:\\WORK\\RES.TXT",
-        "NC -target %UPHOST% " + str(RESULT_PORT) + " < C:\\WORK\\RES.TXT > NUL",
+        UPUT_DOS + " %UPHOST% C:\\WORK\\RES.TXT result",
         # Absolute path first: a job that changed directory (compiling in
         # C:\BPDEMOS, say) would leave a bare REBOOT.COM unresolvable, and
         # failing to reboot *here* is the one place it must not happen.
@@ -464,13 +949,13 @@ def build_agent_batch(job_id, name):
         "ECHO dosd: new agent has no end marker -- transfer was incomplete,"
         " NOT swapped >> C:\\WORK\\RES.TXT",
         "ECHO ##RC=254 >> C:\\WORK\\RES.TXT",
-        "NC -target %UPHOST% " + str(RESULT_PORT) + " < C:\\WORK\\RES.TXT > NUL",
+        UPUT_DOS + " %UPHOST% C:\\WORK\\RES.TXT result",
         "GOTO END",
         ":NOFILE",
         "ECHO ##JOB=%s > C:\\WORK\\RES.TXT" % job_id,
         "ECHO dosd: download of the new agent failed >> C:\\WORK\\RES.TXT",
         "ECHO ##RC=254 >> C:\\WORK\\RES.TXT",
-        "NC -target %UPHOST% " + str(RESULT_PORT) + " < C:\\WORK\\RES.TXT > NUL",
+        UPUT_DOS + " %UPHOST% C:\\WORK\\RES.TXT result",
         ":END",
     ]
 
@@ -540,7 +1025,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/job":
             STATE.last_poll = time.time()
-            job = STATE.take(POLL_HOLD_SECS)
+            job = STATE.take(TFTP_HOLD_SECS)
             if job is None:
                 self._send(200, to_dos_text(IDLE_BATCH))
                 return
@@ -608,6 +1093,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+
+        if path == "/shutdown":
+            # Loopback only, and deliberately so. Every other endpoint
+            # here exists to be reached by the DOS box across the LAN;
+            # this one would let anything on that LAN stop the bridge,
+            # which is a far worse trade than making somebody use the
+            # machine dosd itself runs on.
+            if self.client_address[0] not in ("127.0.0.1", "::1"):
+                self._send(403, "shutdown is local-only\r\n")
+                return
+            self._send(200, "stopping\r\n")
+            log("shutdown requested -- bye")
+            # shutdown() cannot be called from inside a handler: it waits
+            # for the serve_forever loop to finish, and that loop is
+            # waiting on this handler. A thread breaks the cycle.
+            threading.Thread(target=self.server.shutdown,
+                             daemon=True).start()
+            return
+
         if path != "/queue":
             self._send(404, "not found\r\n")
             return
@@ -637,7 +1141,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if kind == "run":
             batch = build_run_batch(jid, req["name"], req.get("args", ""),
-                                    req.get("reboot", False), req.get("cold", False))
+                                    req.get("reboot", False),
+                                    req.get("cold", False),
+                                    echo=req.get("echo"))
             label = "run %s" % req["name"]
         elif kind == "driver":
             batch = build_driver_batch(jid, req["name"], req.get("args", ""),
@@ -648,7 +1154,7 @@ class Handler(BaseHTTPRequestHandler):
             batch = build_reboot_batch(req.get("cold", False))
             label = "reboot"
         elif kind == "raw":
-            batch = build_raw_batch(jid, req["cmds"])
+            batch = build_raw_batch(jid, req["cmds"], echo=req.get("echo"))
             label = "raw (%d cmds)" % len(req["cmds"])
         elif kind == "pull":
             batch = build_pull_batch(jid, req["path"])
@@ -674,6 +1180,41 @@ class Handler(BaseHTTPRequestHandler):
 # Raw TCP result intake (mTCP NC pushes here)
 # ---------------------------------------------------------------------------
 
+def ingest_result(payload):
+    """Parse one result report and hand it to the waiting job.
+
+    Factored out of ResultHandler so the TCP path (NC) and the TFTP path
+    (UPUT) cannot drift: they are two transports for one wire format, and a
+    result that parsed differently depending on how it arrived would be a
+    genuinely horrible bug to chase.
+    """
+    raw = payload.decode("cp437", errors="replace")
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+
+    job_id, rc, body = None, None, []
+    for line in raw.split("\n"):
+        s = line.strip()
+        if s.startswith("##JOB="):
+            job_id = s[6:].strip()
+        elif s.startswith("##RC="):
+            try:
+                rc = int(s[5:].strip())
+            except ValueError:
+                rc = None
+        elif s.startswith("##BOOTOK") or s.startswith("##BOOTFAIL"):
+            STATE.boot_events.append({"t": time.time(), "event": s})
+            log("<- boot event: %s" % s)
+            body.append(s)
+        else:
+            body.append(line)
+
+    text = "\n".join(body).strip("\n")
+    if job_id and STATE.deliver(job_id, text, rc):
+        log("<- result  %s  rc=%s  (%d bytes)" % (job_id, rc, len(text)))
+    else:
+        log("<- unmatched report:\n%s" % text[:400])
+
+
 class ResultHandler(socketserver.BaseRequestHandler):
     def handle(self):
         self.request.settimeout(20)
@@ -686,36 +1227,17 @@ class ResultHandler(socketserver.BaseRequestHandler):
                 chunks.append(b)
         except socket.timeout:
             pass
-        raw = b"".join(chunks).decode("cp437", errors="replace")
-        raw = raw.replace("\r\n", "\n").replace("\r", "\n")
-
-        job_id, rc, body = None, None, []
-        for line in raw.split("\n"):
-            s = line.strip()
-            if s.startswith("##JOB="):
-                job_id = s[6:].strip()
-            elif s.startswith("##RC="):
-                try:
-                    rc = int(s[5:].strip())
-                except ValueError:
-                    rc = None
-            elif s.startswith("##BOOTOK") or s.startswith("##BOOTFAIL"):
-                STATE.boot_events.append({"t": time.time(), "event": s})
-                log("<- boot event: %s" % s)
-                body.append(s)
-            else:
-                body.append(line)
-
-        text = "\n".join(body).strip("\n")
-        if job_id and STATE.deliver(job_id, text, rc):
-            log("<- result  %s  rc=%s  (%d bytes)" % (job_id, rc, len(text)))
-        else:
-            log("<- unmatched report:\n%s" % text[:400])
+        ingest_result(b"".join(chunks))
 
 
 class PullHandler(socketserver.BaseRequestHandler):
     """
-    Raw binary intake for `dosctl pull`.
+    Legacy raw binary intake for `dosctl pull`.
+
+    Nothing generates a batch that uses this any more -- pulls go over TFTP
+    under the name `pull`. It is kept listening because it costs one idle
+    socket and it is the only way bytes could still arrive from a DOS box
+    running a batch generated by an older dosd.
 
     Deliberately does nothing to the bytes: no cp437 decode, no CRLF folding,
     no line splitting. That is the whole point of a separate port -- the
@@ -747,8 +1269,572 @@ class ReuseTCPServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+# Where log() mirrors its output, in addition to the console.
+#
+# The daemon's console has been the only record of what it did, and that has
+# cost real time: every question of the form "was that job actually
+# dispatched, and did the box acknowledge it?" is answered in these lines and
+# nowhere else, so anyone not sitting in front of that window has to reason
+# from symptoms instead. Worse, the window scrolls -- the evidence for a
+# failure is routinely gone by the time somebody asks about it.
+#
+# So it is mirrored to a file, unconditionally and by default. The volume is
+# a few lines per poll, and DOSD_LOGFILE= (empty) turns it off for anyone who
+# would rather it did not write.
+LOG_PATH = os.environ.get(
+    "DOSD_LOGFILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "dosd.log"))
+_log_lock = threading.Lock()
+
+
 def log(msg):
-    print("[%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+    line = "[%s] %s" % (time.strftime("%H:%M:%S"), msg)
+    print(line, flush=True)
+    if not LOG_PATH:
+        return
+    # Never let a logging problem take the daemon down: a full disk or a
+    # locked file is a reason to lose the log, not the bridge.
+    try:
+        with _log_lock:
+            with io.open(LOG_PATH, "a", encoding="utf-8", newline="\n") as fh:
+                fh.write("%s %s\n" % (time.strftime("%Y-%m-%d"), line))
+    except Exception:
+        pass
+
+
+
+# ---------------------------------------------------------------------------
+# TFTP  --  the UDP transport that replaces HTGET and NC
+#
+# Four opcodes, 512-byte blocks, one packet in flight. Chosen over
+# reimplementing HTTP because HTTP means TCP, and TCP's failure mode is the
+# one that matters here: correct on the bench, silently corrupting under
+# loss, in the component whose failure cannot be fixed from this side.
+#
+# Note each transfer gets its OWN socket, on an ephemeral port. That is not
+# an implementation detail -- it is the TFTP transfer identifier, and the DOS
+# client locks onto it from the first packet. Serving a whole transfer from
+# the well-known port would work against a naive client and against nothing
+# else.
+# ---------------------------------------------------------------------------
+
+TFTP_BLK = 512
+# Retry budget for a lossy link. The DOS client is deliberately the MORE
+# patient of the two -- whichever side gives up first decides the outcome,
+# and the client is the one that can actually report what happened.
+# RFC 2347 option acknowledgement, and RFC 2348's blksize.
+#
+# 512-byte blocks put a 5 MB transfer at nearly eight minutes on this link,
+# almost all of it per-packet overhead rather than bandwidth. Bigger blocks
+# are the single biggest throughput win available and cost one extra round
+# trip to negotiate.
+#
+# The ceiling is what fits in one Ethernet frame without fragmenting, because
+# the DOS side drops fragments rather than reassembling them: 1500 - 20 (IP)
+# - 8 (UDP) - 4 (TFTP) = 1468. 1400 leaves room for any tunnelling or
+# driver-side overhead and still cuts the packet count by nearly two thirds.
+OP_OACK = 6
+TFTP_BLK_MAX = 1400
+TFTP_RETRIES = 8
+# Retransmits when SERVING A FILE. Separate from the job reply, which
+# wants a short budget (nobody is listening past ~11s), and from this
+# default, which a file transfer wants to exceed: a stalled transfer on
+# this link does not recover inside 16 seconds and dies, while the very
+# next attempt succeeds -- which is what a link-level dropout looks
+# like rather than a lost packet. Overridable so the outage can be
+# measured instead of guessed at.
+FILE_SEND_RETRIES = int(os.environ.get("DOSD_FILE_RETRIES", "8"))
+# Retransmits for a JOB reply only. The client's own patience is about 11
+# seconds, so anything past ~5 attempts at the 2-second timeout is spent
+# talking to nobody. File transfers keep the full budget: there the client
+# really is still waiting.
+POLL_SEND_RETRIES = 5
+TFTP_TIMEOUT = 2.0
+# The job hold is SHORT, and deliberately much shorter than the HTTP
+# path's. Our DOS stack does not answer ARP -- while it holds the IPv4
+# handle it never even sees an ARP request -- so if this host's ARP
+# entry for the box expires during the hold, the reply cannot be
+# delivered and the poll fails with no packet on the wire at all.
+# Measured: an 8-second hold outlived the cache entry often enough to
+# fail roughly one poll in three. Two seconds always lands inside it.
+# The real fix is for the DOS side to answer ARP; until then, do not
+# raise this.
+# NOTE: serve_job holds for POLL_HOLD_SECS, not this. This constant was
+# added when the hold was 'reduced 8s -> 2s' to chase the poll losses,
+# and nothing ever read it -- which is why that change appeared to make
+# no difference. It did not: the hold stayed at 8 seconds.
+TFTP_HOLD_SECS = 2  # unused; see POLL_HOLD_SECS
+
+# Clients that currently have a job request being held open, keyed by their
+# address. The job poll is a LONG poll -- the server sits on the request for
+# several seconds -- so a client that retransmits because it thinks the
+# request was lost would otherwise start a second hold and take a second job
+# off the queue while the first went nowhere. Ignoring the duplicate lets the
+# original hold answer it, which is what makes client retransmission safe,
+# and retransmission is what lets the poll survive a lost packet without an
+# mTCP fallback underneath it.
+_job_holds = {}
+_job_holds_lock = threading.Lock()
+
+OP_RRQ, OP_WRQ, OP_DATA, OP_ACK, OP_ERROR = 1, 2, 3, 4, 5
+
+
+def tftp_error(sock, addr, code, msg):
+    sock.sendto(struct.pack("!HH", OP_ERROR, code)
+                + msg.encode("latin-1", "replace") + b"\0", addr)
+
+
+def tftp_send_blob(sock, addr, blob, retries=None, blk=None):
+    """Serve a blob as a TFTP read.
+
+    Returns (ok, blocks_acked). The count matters for the job resource: a
+    client that acknowledged nothing definitely never saw the batch, so the
+    job can be safely put back on the queue. One that acknowledged part of it
+    may well have the whole thing, and requeueing then would run somebody's
+    job twice.
+
+    `retries` exists because retransmitting is only useful while somebody is
+    still listening. The default budget is 8 attempts at a 2-second timeout --
+    16 seconds - which is right for a file transfer the client will wait out,
+    and pure waste for the job poll: UGET gives up after about 11 seconds, so
+    the last five were spent shouting at a client that had already gone, on a
+    thread that could not report the failure until it finished. It also
+    delayed the NO ACK log line past the point where it lined up with anything
+    else on the screen.
+    """
+    if retries is None:
+        retries = TFTP_RETRIES
+    if blk is None:
+        blk = TFTP_BLK
+    block, off = 1, 0
+    acked_count = 0
+    while True:
+        chunk = blob[off:off + blk]
+        pkt = struct.pack("!HH", OP_DATA, block & 0xFFFF) + chunk
+        acked = False
+        for _ in range(retries):
+            sock.sendto(pkt, addr)
+            try:
+                while True:
+                    data, src = sock.recvfrom(1024)
+                    if src != addr or len(data) < 4:
+                        continue
+                    # NOT `blk` -- that is the block SIZE, and unpacking
+                    # the acknowledged block NUMBER over it silently rewrote
+                    # the size to 1 on the first ACK. Every transfer then sent
+                    # 512 bytes followed by a single byte, which the client
+                    # correctly read as a short final block: a 513-byte file,
+                    # complete as far as both ends could tell. That truncated
+                    # a job batch to its first few lines -- the program ran and
+                    # the result send was never in the file -- and it is where
+                    # "UGET.EXE is 513 bytes" came from when a deploy of it
+                    # stranded the box.
+                    op, ack_blk = struct.unpack("!HH", data[:4])
+                    if op == OP_ERROR:
+                        return False, acked_count
+                    if op != OP_ACK:
+                        continue
+                    if ack_blk == (block & 0xFFFF):
+                        acked = True
+                        break
+                    # A duplicate ACK for an earlier block. It means our DATA
+                    # never arrived, so break out and send it again NOW.
+                    #
+                    # This line is the whole fix for large transfers, and the
+                    # bug it removes is a genuine deadlock rather than a lost
+                    # packet. `continue` here -- which is what it used to do --
+                    # goes back to recvfrom with a FRESH two-second timeout.
+                    # The client, having timed out waiting for the block,
+                    # re-ACKs the previous one every two seconds. Each of those
+                    # reset this timer, so the server never reached its
+                    # timeout and therefore never retransmitted, while the
+                    # client sat waiting for a block that was never coming.
+                    # Both sides then waited for each other until the client
+                    # exhausted its retries and declared the transfer stalled.
+                    #
+                    # One lost DATA packet was enough to trigger it, which is
+                    # why it looked size-dependent: 68-block transfers almost
+                    # always got through untouched and 600-block ones never
+                    # did. Measured before the fix: 34 KB succeeded 38 times
+                    # out of 38, while 300 KB failed 6 times out of 6, each at
+                    # a different block. The next transfer always worked,
+                    # which is what sent the investigation chasing link-level
+                    # dropouts and ARP expiry for far too long.
+                    break
+            except socket.timeout:
+                continue
+            if acked:
+                break
+        if not acked:
+            return False, acked_count
+        acked_count += 1
+        off += len(chunk)
+        block += 1
+        # A short block ends the transfer by definition; a file that is an
+        # exact multiple of the block size ends with an empty one.
+        if len(chunk) < blk:
+            return True, acked_count
+
+
+def tftp_parse_options(parts):
+    """Options from an RRQ: name\0mode\0 then key\0value\0 pairs."""
+    opts = {}
+    rest = parts[2:]
+    for i in range(0, len(rest) - 1, 2):
+        k = rest[i].decode("latin-1", "replace").lower()
+        v = rest[i + 1].decode("latin-1", "replace")
+        if k:
+            opts[k] = v
+    return opts
+
+
+def tftp_send_oack(sock, addr, opts, retries):
+    """Acknowledge the options we accepted, and wait for the ACK of block 0.
+
+    RFC 2347: the OACK replaces DATA block 1 as the first thing the client
+    hears, and the client answers it with an ACK for block 0 before any data
+    moves. Only options we are actually honouring get echoed; anything left
+    out keeps its default, which is what lets an old client and a new server
+    (or the reverse) still talk.
+    """
+    pkt = struct.pack("!H", OP_OACK)
+    for k, v in opts:
+        pkt += k.encode() + b"\0" + str(v).encode() + b"\0"
+    for _ in range(retries):
+        sock.sendto(pkt, addr)
+        try:
+            while True:
+                data, src = sock.recvfrom(1024)
+                if src != addr or len(data) < 4:
+                    continue
+                op, blk = struct.unpack("!HH", data[:4])
+                if op == OP_ERROR:
+                    return False
+                if op == OP_ACK and blk == 0:
+                    return True
+                # Anything else: resend the OACK now rather than waiting out
+                # the timeout, for the same reason DATA does.
+                break
+        except socket.timeout:
+            continue
+    return False
+
+
+# Writes that stalled partway, keyed by (client address, name).
+#
+# The client tears its flow down and asks again from the byte it last had
+# acknowledged -- the same trick TftpGet uses, because a fresh flow is the
+# only thing that has ever cleared this link's mid-transfer stall. That only
+# works if the server still holds what arrived before, so the bytes outlive
+# the flow that carried them.
+#
+# Pruned by age rather than on failure: the whole point is to keep a partial
+# alive across a gap, so it cannot be discarded when the transfer that made
+# it goes quiet.
+_uploads = {}
+_uploads_lock = threading.Lock()
+UPLOAD_TTL = 600
+
+
+def upload_buf(key, resume_at):
+    """The buffer to append a write into, or None if it cannot be resumed."""
+    now = time.time()
+    with _uploads_lock:
+        for k in [k for k, v in _uploads.items() if now - v[1] > UPLOAD_TTL]:
+            del _uploads[k]
+        if resume_at == 0:
+            buf = bytearray()
+            _uploads[key] = [buf, now]
+            return buf
+        ent = _uploads.get(key)
+        # The client resumes from the last byte IT saw acknowledged, so it is
+        # normally BEHIND us: every ACK we sent whose reply was lost left us
+        # holding a block the client still believes it owes. Rewinding to the
+        # client's figure is correct -- it is about to send those blocks
+        # again, identically.
+        #
+        # Asking to resume PAST what we hold is the one case that must be
+        # refused: there is no way to fill the gap, and appending anyway would
+        # produce a plausible file with a hole in it that nothing downstream
+        # would notice.
+        if ent is None or resume_at > len(ent[0]):
+            _uploads.pop(key, None)
+            return None
+        # A fresh bytearray rather than truncating in place. The flow that
+        # stalled may still be inside its retry loop on another thread,
+        # holding a reference to the old object; letting it append into the
+        # buffer this flow is filling would interleave two writers.
+        buf = bytearray(ent[0][:resume_at])
+        _uploads[key] = [buf, now]
+        return buf
+
+
+def tftp_recv_blob(sock, addr, blk_size=None, oack=None, out=None):
+    """Take a TFTP write. Returns the bytes, or None if it failed.
+
+    `blk_size` is the negotiated block size; `oack` is the option list to
+    acknowledge, or None to start the transfer with a plain ACK of block 0.
+    RFC 2347 puts the OACK in place of that first ACK -- sending both would
+    have the client answer twice.
+    """
+    if blk_size is None:
+        blk_size = TFTP_BLK
+    if out is None:
+        out = bytearray()
+    expect, last_ack = 1, 0
+    if oack:
+        first = struct.pack("!H", OP_OACK)
+        for k, v in oack:
+            first += k.encode() + b"\0" + str(v).encode() + b"\0"
+    else:
+        first = struct.pack("!HH", OP_ACK, 0)
+    sock.sendto(first, addr)
+    while True:
+        got = None
+        for _ in range(TFTP_RETRIES):
+            try:
+                data, src = sock.recvfrom(blk_size + 512)
+            except socket.timeout:
+                # Re-send whatever started or last advanced the transfer. On
+                # the very first block that is the OACK, not an ACK: a client
+                # waiting for its options to be confirmed ignores an ACK 0 it
+                # never asked for, and the transfer would stall here.
+                sock.sendto(first if last_ack == 0 else
+                            struct.pack("!HH", OP_ACK, last_ack), addr)
+                continue
+            if src != addr or len(data) < 4:
+                continue
+            op, blk = struct.unpack("!HH", data[:4])
+            if op == OP_ERROR:
+                return None
+            if op != OP_DATA:
+                continue
+            got = (blk, data[4:])
+            break
+        if got is None:
+            return None
+        blk, payload = got
+        if blk == (expect & 0xFFFF):
+            out += payload
+            sock.sendto(struct.pack("!HH", OP_ACK, blk), addr)
+            last_ack, expect = blk, expect + 1
+            if len(payload) < blk_size:
+                return bytes(out)
+        elif blk == ((expect - 1) & 0xFFFF):
+            # They did not hear the ACK. Re-ACK without appending, or the
+            # blob silently gains a duplicate block.
+            sock.sendto(struct.pack("!HH", OP_ACK, blk), addr)
+
+
+def serve_job(sock, addr):
+    """Hold a job request open, then hand over whatever came up."""
+    # last_poll is stamped before the hold, so `dosctl status` does not call a
+    # box stale while it is legitimately waiting on us.
+    STATE.last_poll = time.time()
+    log("   job RRQ from %s:%d -- holding" % addr)
+    job = STATE.take(POLL_HOLD_SECS)
+    if job is None:
+        ok, _ = tftp_send_blob(sock, addr, to_dos_text(IDLE_BATCH),
+                               retries=POLL_SEND_RETRIES)
+        log("   idle batch -> %s:%d  %s" % (addr[0], addr[1],
+                                            "acked" if ok else "NO ACK"))
+        return
+    job.dispatched_at = time.time()
+    with STATE.lock:
+        STATE.awaiting = job
+        if job.kind == "pull":
+            STATE.awaiting_pull = job
+    log("-> dispatch %s  %s  (tftp)" % (job.id, job.label))
+    ok, acked = tftp_send_blob(sock, addr, to_dos_text(job.batch),
+                               retries=POLL_SEND_RETRIES)
+    if ok:
+        return
+
+    # Delivery failed. Whether the job can be put back depends on how far it
+    # got: a client that acknowledged NOTHING never saw the batch, so
+    # requeueing is safe and stops the job being lost. One that acknowledged
+    # part of it may hold the complete file already, and requeueing would run
+    # it twice -- worse than losing it, because a repeat of an arbitrary
+    # command is not something the caller can see or undo.
+    if acked == 0:
+        with STATE.lock:
+            if STATE.awaiting is job:
+                STATE.awaiting = None
+            if STATE.awaiting_pull is job:
+                STATE.awaiting_pull = None
+        STATE.pending.put(job)
+        log("   udp dispatch of %s failed with nothing acked -- requeued"
+            % job.id)
+    else:
+        log("   udp dispatch of %s failed after %d block(s) acked -- NOT "
+            "requeued, it may already have run" % (job.id, acked))
+
+
+def tftp_serve(req, addr):
+    if len(req) < 4:
+        return
+    op = struct.unpack("!H", req[:2])[0]
+    parts = req[2:].split(b"\0")
+    name = parts[0].decode("latin-1", "replace")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("", 0))
+    sock.settimeout(TFTP_TIMEOUT)
+    try:
+        if op == OP_RRQ:
+            if name.lower() == "job":
+                with _job_holds_lock:
+                    if addr in _job_holds:
+                        # A retransmit of a request we are already holding.
+                        # Drop it; the original hold will answer.
+                        return
+                    _job_holds[addr] = True
+                try:
+                    serve_job(sock, addr)
+                finally:
+                    with _job_holds_lock:
+                        _job_holds.pop(addr, None)
+                return
+
+            # "name@12345" means "send me this file from byte 12345".
+            #
+            # TFTP has no notion of resuming, and this is the smallest thing
+            # that gives us one. It exists because of a failure this link has
+            # that nothing on the DOS side can reach: partway through a long
+            # transfer, frames addressed to the box's MAC stop being delivered
+            # to it while broadcasts keep arriving, and no amount of retrying,
+            # re-taking the packet driver handle, or even putting the card in
+            # promiscuous mode brings them back. A brand new flow, however,
+            # always works -- which is why every transfer succeeded on the
+            # attempt after the one that stalled.
+            #
+            # So rather than start a 5 MB file again from nothing, the client
+            # tears its flow down completely and asks for the rest.
+            resume_at = 0
+            if "@" in name:
+                name, _, tail = name.rpartition("@")
+                if not tail.isdigit():
+                    tftp_error(sock, addr, 4, "bad resume offset")
+                    return
+                resume_at = int(tail)
+
+            rel = safe_rel(name)
+            full = rel_to_path(rel) if rel else None
+            if full is None or not os.path.isfile(full):
+                log("tftp: %s asked for %r -- not found" % (addr[0], name))
+                tftp_error(sock, addr, 1, "file not found")
+                return
+            with open(full, "rb") as fh:
+                blob = fh.read()
+            blk = TFTP_BLK
+            opts = tftp_parse_options(parts)
+            if "blksize" in opts:
+                try:
+                    want = int(opts["blksize"])
+                except ValueError:
+                    want = TFTP_BLK
+                blk = max(8, min(want, TFTP_BLK_MAX))
+            if resume_at:
+                if resume_at > len(blob):
+                    tftp_error(sock, addr, 1, "resume past end of file")
+                    return
+                log("tftp: %s resuming %s at byte %d"
+                    % (addr[0], name, resume_at))
+                blob = blob[resume_at:]
+            if blk != TFTP_BLK:
+                if not tftp_send_oack(sock, addr, [("blksize", blk)],
+                                      FILE_SEND_RETRIES):
+                    log("tftp: %s did not confirm blksize %d for %s"
+                        % (addr[0], blk, name))
+                    return
+            ok, _ = tftp_send_blob(sock, addr, blob,
+                                   retries=FILE_SEND_RETRIES, blk=blk)
+            log("tftp: sent %s (%d bytes, blk %d) to %s%s"
+                % (name, len(blob), blk, addr[0], "" if ok else "  FAILED"))
+
+        elif op == OP_WRQ:
+            # "name@12345" resumes a write that stalled, the mirror of the
+            # read side above.
+            resume_at = 0
+            if "@" in name:
+                name, _, tail = name.rpartition("@")
+                if not tail.isdigit():
+                    tftp_error(sock, addr, 4, "bad resume offset")
+                    return
+                resume_at = int(tail)
+
+            ukey = (addr[0], name.lower())
+            buf = upload_buf(ukey, resume_at)
+            if buf is None:
+                log("tftp: %s cannot resume write of %s at byte %d "
+                    "-- nothing held that far" % (addr[0], name, resume_at))
+                tftp_error(sock, addr, 3, "cannot resume there")
+                return
+            if resume_at:
+                log("tftp: %s resuming write of %s at byte %d"
+                    % (addr[0], name, resume_at))
+
+            wopts = tftp_parse_options(parts)
+            wblk, wack = TFTP_BLK, None
+            if "blksize" in wopts:
+                try:
+                    want = int(wopts["blksize"])
+                except ValueError:
+                    want = TFTP_BLK
+                wblk = max(8, min(want, TFTP_BLK_MAX))
+                if wblk != TFTP_BLK:
+                    wack = [("blksize", wblk)]
+            blob = tftp_recv_blob(sock, addr, blk_size=wblk, oack=wack,
+                                  out=buf)
+            if blob is None:
+                # Keep what arrived. The client is expected to come back with
+                # a new flow asking to carry on, and throwing the bytes away
+                # here would make that impossible.
+                log("tftp: write of %r from %s stalled at %d bytes"
+                    % (name, addr[0], len(buf)))
+                return
+            with _uploads_lock:
+                _uploads.pop(ukey, None)
+            if name.lower() in ("result", "result.txt"):
+                ingest_result(blob)
+            elif name.lower() == "pull":
+                # A pull's bytes, over our own stack. Same sink the legacy
+                # NC path used, so dosctl is unchanged either way.
+                if STATE.deliver_blob(blob):
+                    log("tftp: pulled %d bytes from %s" % (len(blob), addr[0]))
+                else:
+                    log("tftp: %d-byte pull from %s with no pull in flight"
+                        % (len(blob), addr[0]))
+            else:
+                rel = safe_rel(name)
+                full = rel_to_path(rel) if rel else None
+                if full is None:
+                    log("tftp: refusing write to %r" % name)
+                    return
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                with open(full, "wb") as fh:
+                    fh.write(blob)
+                log("tftp: received %s (%d bytes) from %s"
+                    % (name, len(blob), addr[0]))
+        else:
+            tftp_error(sock, addr, 4, "illegal TFTP operation")
+    except OSError as e:
+        log("tftp: %s" % e)
+    finally:
+        sock.close()
+
+
+def tftp_listen():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", TFTP_PORT))
+    while True:
+        try:
+            req, addr = s.recvfrom(2048)
+        except OSError:
+            continue
+        threading.Thread(target=tftp_serve, args=(req, addr),
+                         daemon=True).start()
 
 
 def main():
@@ -764,8 +1850,9 @@ def main():
 
     threading.Thread(target=raw.serve_forever, daemon=True).start()
     threading.Thread(target=pull.serve_forever, daemon=True).start()
-    log("dosd listening: http :%d   results :%d   pull :%d"
-        % (HTTP_PORT, RESULT_PORT, PULL_PORT))
+    threading.Thread(target=tftp_listen, daemon=True).start()
+    log("dosd listening: http :%d   results :%d   pull :%d   tftp/udp :%d"
+        % (HTTP_PORT, RESULT_PORT, PULL_PORT, TFTP_PORT))
     # Present only in a built installer, never in the dev tree -- so this line
     # appears exactly when it is useful: telling you which packaged build a
     # machine is running, without having to ask its owner.
@@ -782,6 +1869,24 @@ def main():
         http.serve_forever()
     except KeyboardInterrupt:
         log("bye")
+    finally:
+        # Restarting dosd is routine -- several times in a bad session -- so
+        # release the listeners rather than leaving the next start to fail on
+        # "address already in use".
+        # Stop each accept loop BEFORE closing its socket. Closing one out
+        # from under the thread still selecting on it raises WinError 10038
+        # on the way out -- harmless, but a stack trace at shutdown is
+        # indistinguishable at a glance from a crash.
+        for srv in (raw, pull):
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
+        for srv in (http, raw, pull):
+            try:
+                srv.server_close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

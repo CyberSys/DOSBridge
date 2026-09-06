@@ -186,12 +186,22 @@ try:
     out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
                          capture_output=True, text=True, timeout=60).stdout.strip()
     if not out or out == "NONE":
-        line("WARN", "inbound rule for 8080/8081/8082",
+        line("WARN", "inbound rules",
              "no 'dosbridge' rule found - the DOS box may be unable to reach us")
     else:
         ports = out.replace("\n", " ")
-        need = all(p in out for p in ("8080", "8081", "8082"))
-        line("ok" if need else "WARN", "inbound rule for 8080/8081/8082", ports)
+        # UDP 8069 is checked on its own because it is the one that actually
+        # carries traffic now: the job poll, every file transfer and every
+        # result run over TFTP. The TCP ports are the legacy path, so a host
+        # with those open and 8069 shut looks perfectly configured and gives
+        # you a box that boots, banners, and never polls.
+        line("ok" if "8069" in out else "FAIL",
+             "inbound UDP 8069 (TFTP)",
+             ports if "8069" in out
+             else "MISSING - the DOS box will never be answered. Re-run "
+                  "install.cmd as Administrator.")
+        legacy = all(p in out for p in ("8080", "8081", "8082"))
+        line("ok" if legacy else "WARN", "inbound TCP 8080/8081/8082", ports)
 except Exception as e:
     line("WARN", "firewall rule", "could not check (%s)" % e.__class__.__name__)
 

@@ -65,6 +65,7 @@ pulls in with `uses`; everything else builds to an `.EXE` of the same name.
 | `cpu.pas` | run-time CPU and coprocessor identification: `Has186`, `HasFpu` |
 | `vga.pas` | mode 13h plumbing: `SetMode`, `FillSpan`, palette, retrace |
 | `prof.pas` | section timing and a stack watermark, PIT-resolution |
+| `net.pas` | IPv4 + UDP on the packet driver -- no mTCP. Always `NetClose` |
 | `modex.pas` | unchained 320x200x256, virtual screen wider than the display |
 
 **Machine and diagnostics**
@@ -85,6 +86,7 @@ pulls in with `uses`; everything else builds to an `.EXE` of the same name.
 | `mouse.pas` | exercise the mouse through INT 33h |
 | `beep.pas` | PC speaker; `ALERT` when a human is needed |
 | `mkkeyhit.py` | **not Pascal** -- emits the 22-byte `KEYHIT.COM` the agent polls |
+| `elapsed.asm` | **not Pascal** -- NASM. `ELAPSED.COM`, the job stopwatch behind the console's footer line. `cpu 8086` makes the assembler enforce the baseline; MNASMFIX-compatible so it also builds on the box |
 | `opl2.pas` | AdLib / OPL2 plumbing: detect, register writes, patches, notes |
 
 **Video**
@@ -104,18 +106,24 @@ pulls in with `uses`; everything else builds to an `.EXE` of the same name.
 | `pktdrv.pas` | find the driver and describe it. Read-only, opens no handle |
 | `pktcap.pas` | capture Ethernet frames. Opens a handle — read its header first |
 | `arp.pas` | who-has queries and `/24` sweeps; the first tool that transmits |
+| `ntp.pas` | asks an NTP server the time over our own UDP. Read-only |
+| `tftp.pas` | TFTP client on top of `Net` -- both directions, stop-and-wait, 1400-byte blocks (RFC 2348), and resume-from-offset when a transfer stalls |
+| `uget.pas` | `UGET`: fetch from dosd over UDP. Replaces mTCP's `HTGET` |
+| `uput.pas` | `UPUT`: send to dosd over UDP. Replaces mTCP's `NC` |
 
 **Demos**
 
 | | |
 |---|---|
 | `hello.pas` | smoke test, deliberately fails one check |
+| `raycast.pas` | Wolfenstein-style raycaster; no divides in the DDA, `REP STOSB` blitter, 8087 for the perspective divide |
 | `fractal.pas` | Mandelbrot, Q8 integer or 8087, with `ZOOM` |
 | `balls.pas` | bouncing balls in mode 13h |
 | `matrix.pas` | falling green text, text mode |
 | `svgatext.pas` | rotating text; VBE 640x480x256 if offered, else mode 13h |
 | `scroller.pas` | mode X scroller: sprites, AdLib music, 70 fps. See `SCROLLER.md` |
 | `music.pas` | the scroller's tune, driven from inside a frame loop |
+| `mystery.pas` | the raycaster's theme: chromatic bass, a tritone, and no resolution |
 | `gtest.pas` | mode 13h test pattern, leaves the mode set for `VSHOT` |
 | `mozart.pas` | Eine kleine Nachtmusik on the PC speaker, one voice |
 | `amozart.pas` | the same in two voices on an AdLib/OPL2, detected first |

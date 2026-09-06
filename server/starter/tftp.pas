@@ -1,0 +1,864 @@
+{ tftp.pas -- TFTP over our own UDP, both directions.
+
+  DOS Bridge  --  StevenC
+
+  WHY TFTP AND NOT HTTP
+
+  Replacing the old fetch and send tools literally would mean writing TCP:
+  they were an HTTP client and a raw TCP client. TCP's failure mode is the bad
+  one -- correct on the bench, silently corrupting under loss -- and the
+  transport is the one
+  component of this bridge whose failure cannot be fixed from the Windows
+  side. TFTP is the opposite trade: four opcodes, 512-byte blocks, one packet
+  in flight at a time, and every failure is a timeout you can see.
+
+  It is also the protocol that was designed for precisely this situation -- a
+  machine with no stack that needs to move a file -- which is why it fits the
+  bridge's three jobs exactly: fetch a job batch, fetch a program, push a
+  result.
+
+  WHY STOP-AND-WAIT MAKES THE DISK SAFE
+
+  Writing to disk while a packet handle is open would normally be a race: a
+  frame arriving mid-write is dropped, because the receiver refuses anything
+  while Busy is set. Stop-and-wait removes the race entirely -- the server
+  does not send block N+1 until it has our ACK for block N, so there is
+  nothing on the wire while we are in DOS. That is worth knowing before
+  anyone "optimises" this into a windowed transfer.
+
+  Note the receiver never calls DOS itself, so DOS reentrancy is not the
+  issue here; the issue is only whether a frame can arrive unheard.
+
+  THE TRANSFER IDENTIFIER
+
+  A TFTP server answers from a NEW ephemeral port, not from the port the
+  request was sent to. Every packet after the first must be aimed at that
+  port. Keep replying to the well-known port and a correct server ignores
+  you -- which looks exactly like a server that is not running. }
+
+unit Tftp;
+
+{$MODE OBJFPC}{$H-}
+
+interface
+
+uses Net;
+
+const
+  TFTP_PORT = 8069;          { dosd's TFTP endpoint; 69 needs privilege }
+  TFTP_BLK  = 512;
+  { RFC 2348. The ceiling is what fits in one Ethernet frame without
+    fragmenting -- 1500 - 20 (IP) - 8 (UDP) - 4 (TFTP) = 1468 -- because the
+    receiver in Net drops fragments rather than reassembling them. 1400
+    leaves headroom and still cuts the packet count by nearly two thirds,
+    which on this link is most of the transfer time. }
+  TFTP_BLK_MAX = 1400;
+
+  OP_RRQ   = 1;
+  OP_WRQ   = 2;
+  OP_DATA  = 3;
+  OP_ACK   = 4;
+  OP_ERROR = 5;
+  OP_OACK  = 6;               { RFC 2347 option acknowledgement }
+
+var
+  TftpErr     : ShortString;   { why the last call returned False }
+  TftpBytes   : LongInt;       { payload bytes transferred }
+  TftpBlocks  : LongInt;
+  TftpResends : Word;          { our retransmits -- packets we lost }
+  TftpDups    : Word;          { blocks re-sent to us -- ACKs they lost }
+  TftpRestarts: Integer;       { flows rebuilt mid-transfer after a stall }
+
+  { What the wire looked like WHILE a transfer was stalled.
+
+    This is the measurement the four dead hypotheses in CLAUDE.md never had.
+    The stall is: frames stop being delivered to this card partway through a
+    transfer, while broadcasts keep arriving. That last clause was an eyeball
+    observation, and everything since has been built on it -- so it is worth
+    counting properly, because it splits the remaining possibilities cleanly.
+
+      frames arrived, none of them ours  -> the card is still receiving. Our
+        packets specifically are not getting through, or are arriving and
+        being rejected by our own address/port match. Suspect addressing,
+        the server's idea of our port, or the receiver's filter.
+      nothing arrived at all             -> the card stopped receiving. Not
+        something the client can fix, and not our filter's fault.
+
+    PKTCAP cannot answer this, which is why it is instrumented here instead:
+    it would need a second access_type for the same ethertype the transfer is
+    using, which the driver is entitled to refuse -- and capturing ALL takes
+    frames away from the very transfer being watched. The observer would
+    change the thing observed. }
+  TftpStallRx   : Word;        { accepted for us during stall windows }
+  TftpStallWrong: Word;        { arrived, parsed, not ours }
+  TftpStallDrop : Word;        { refused: receiver busy, or oversized }
+  { Set by the caller BEFORE a get: the block size to ask for, or 0 to ask
+    for nothing and stay on the 512-byte default. The job poll leaves it at
+    0 -- a job batch is a couple of blocks and does not want an extra round
+    trip on every poll. }
+  TftpWantBlk : Word;
+  TftpBlkSize : Word;          { what was actually agreed, 512 if no OACK }
+  TftpPeerTID : Word;
+
+{ FirstWait is separate from the per-block timeout because the job poll is a
+  long poll: the server deliberately holds the request open for several
+  seconds before answering, and treating that as a lost packet would make the
+  client retransmit a request the server is still working on. }
+function TftpGet(SrvPort: Word; const Remote, Local: ShortString;
+                 FirstWait: LongInt; RetryFirst: Boolean): Boolean;
+function TftpPut(SrvPort: Word; const Local, Remote: ShortString): Boolean;
+
+implementation
+
+const
+  { Budgets sized for a lossy link, and sized to OUTLAST the server's.
+
+    They were 1 second and 5 retries, which gave up after about five seconds
+    while dosd was still retransmitting out to ten -- so a burst of loss
+    ended the transfer even though the other end had not finished trying.
+    Whichever side gives up first decides the outcome, so the client must be
+    the more patient of the two. Measured on this PicoMEM WiFi link: bursts
+    of three or more consecutive losses of the same block do happen. }
+  TIMEOUT_TICKS = 36;        { ~2 seconds at 18.2 Hz }
+  { 10 x 2s. This was raised to 60 while hunting the large-transfer
+    failures and it made no difference at all -- which was itself the
+    proof that the bug was a deadlock in the SERVER's send loop and
+    not a shortage of patience here. More retries meant more stale
+    ACKs, which was exactly what kept the server from retransmitting. }
+  MAX_RETRIES   = 10;        { ~20 seconds of trying }
+  { Requests get their own, smaller budget. Each attempt at a request may
+    wait many seconds -- the job poll is a long poll -- so five of them would
+    be half a minute of silence before the caller heard anything. }
+  MAX_RQ_TRIES  = 2;
+  { A stall is spotted long before the flow is given up on. Three silent
+    timeouts is six seconds; waiting out all of MAX_RETRIES first would cost
+    twenty seconds per stall, which is unaffordable on a file that stalls
+    every 45 KB. }
+  RESTART_AFTER = 3;
+  MAX_RESTARTS  = 250;
+  { Restarts that moved no data AT ALL, consecutively, before giving up.
+
+    MAX_RESTARTS alone is not a timeout, and treating it as one is what made
+    this machine look like it was freezing. 250 restarts at roughly six
+    seconds each is twenty-five minutes of silent grinding, plus an ARP on
+    every one -- and the observed "hangs" were 10, 43 and 48 minutes of a box
+    that had simply stopped polling. It was never wedged. It was still trying.
+
+    The count is right for what it was sized for: a 5 MB file over a link that
+    genuinely stalls every 45 KB needs about 110 restarts, and each of those
+    moves data. It is catastrophic for a peer that is not there, because a
+    restart count cannot tell "slow and lossy" from "gone".
+
+    So budget restarts against PROGRESS instead. A restart that recovers even
+    one block is the fault this mechanism was built for and costs nothing from
+    this budget; a run of restarts that move nothing is a dead peer, and three
+    of those is about twenty seconds -- after which the caller fails, the
+    agent's offline branch takes over, and the box keeps polling. }
+  DEAD_RESTARTS = 3;
+
+type
+  { Sized for the largest block we will ever negotiate, plus TFTP and
+    slack. Two of these is about 2.9 KB of the 514 KB heap. }
+  TBuf = array[0 .. TFTP_BLK_MAX + 63] of Byte;
+
+var
+  Pkt  : TBuf;               { outgoing }
+  RxP  : TBuf;               { incoming }
+  MyPort : Word;
+
+function Num(L: LongInt): ShortString;
+var S: ShortString;
+begin
+  Str(L, S);
+  Num := S;
+end;
+
+procedure PutW(var P: TBuf; Ofs, V: Word);
+begin
+  P[Ofs] := Hi(V);
+  P[Ofs + 1] := Lo(V);
+end;
+
+function GetW(var P: TBuf; Ofs: Word): Word;
+begin
+  GetW := (Word(P[Ofs]) shl 8) or P[Ofs + 1];
+end;
+
+{ Pick a source port that changes run to run. A fixed one would happily
+  accept a straggler from the PREVIOUS transfer -- a duplicate ACK arriving
+  late is enough to desynchronise a stop-and-wait exchange. }
+procedure PickPort;
+begin
+  MyPort := 20000 + Word(NetTicks and $0FFF);
+end;
+
+{ RRQ/WRQ: opcode, filename, 0, "octet", 0. netascii is not offered -- it
+  rewrites line endings, and this moves .EXE files. }
+{ Pull blksize out of an OACK. Anything we asked for that is not echoed
+  keeps its default, which is what RFC 2347 requires and what lets this talk
+  to a server that only understands some of the options. }
+function OackBlkSize(Len: Word): Word;
+var
+  I    : Word;
+  S    : ShortString;
+  V    : LongInt;
+  Code : Integer;
+  Want : Boolean;
+begin
+  OackBlkSize := TFTP_BLK;
+  Want := False;
+  I := 2;
+  while I < Len do
+  begin
+    S := '';
+    while (I < Len) and (RxP[I] <> 0) do
+    begin
+      if Length(S) < 40 then S := S + UpCase(Chr(RxP[I]));
+      Inc(I);
+    end;
+    Inc(I);                    { step over the terminator }
+    if Want then
+    begin
+      Val(S, V, Code);
+      if (Code = 0) and (V >= 8) and (V <= TFTP_BLK_MAX) then
+        OackBlkSize := Word(V);
+      Want := False;
+    end
+    else if S = 'BLKSIZE' then
+      Want := True;
+  end;
+end;
+
+function BuildRQ(Op: Word; const Name: ShortString): Word;
+var
+  I, N: Word;
+  Opt : ShortString;
+
+  procedure PutZ(const S: ShortString);
+  var K: Word;
+  begin
+    for K := 1 to Length(S) do
+    begin
+      Pkt[N] := Ord(S[K]);
+      Inc(N);
+    end;
+    Pkt[N] := 0;
+    Inc(N);
+  end;
+
+begin
+  PutW(Pkt, 0, Op);
+  N := 2;
+  for I := 1 to Length(Name) do
+  begin
+    Pkt[N] := Ord(Name[I]);
+    Inc(N);
+  end;
+  Pkt[N] := 0; Inc(N);
+  Pkt[N] := Ord('o'); Inc(N);
+  Pkt[N] := Ord('c'); Inc(N);
+  Pkt[N] := Ord('t'); Inc(N);
+  Pkt[N] := Ord('e'); Inc(N);
+  Pkt[N] := Ord('t'); Inc(N);
+  Pkt[N] := 0; Inc(N);
+  { An option the server does not understand is ignored and it simply sends
+    512-byte blocks, so asking costs nothing against an older dosd. }
+  if TftpWantBlk > 0 then
+  begin
+    Opt := 'blksize';
+    PutZ(Opt);
+    Opt := Num(TftpWantBlk);
+    PutZ(Opt);
+  end;
+  BuildRQ := N;
+end;
+
+{ An ERROR packet carries a NUL-terminated human message after the code.
+  Reporting it verbatim is the difference between "the transfer failed" and
+  "file not found" -- and the server is the only one that knows which. }
+function ErrText(Got: Word): ShortString;
+var
+  S: ShortString;
+  I: Word;
+begin
+  S := '';
+  I := 4;
+  while (I < Got) and (RxP[I] <> 0) and (Length(S) < 200) do
+  begin
+    S := S + Chr(RxP[I]);
+    Inc(I);
+  end;
+  if Length(S) > 40 then S := Copy(S, 1, 40);
+  ErrText := 'server said: ' + S;
+end;
+
+function TftpGet(SrvPort: Word; const Remote, Local: ShortString;
+                 FirstWait: LongInt; RetryFirst: Boolean): Boolean;
+var
+  F        : file;
+  FOpen    : Boolean;
+  RQLen    : Word;
+  Got      : Word;
+  Op, Blk  : Word;
+  Expect   : Word;
+  Tries    : Integer;
+  DeadRuns : Integer;          { consecutive restarts that moved nothing }
+  DeadMark : LongInt;          { TftpBytes as of the last restart }
+  MarkRx, MarkWr, MarkDr : Word;   { receiver counters at the last restart }
+  DataLen  : Word;
+  Wrote    : Integer;
+  Wait     : LongInt;
+  MaxRq    : Integer;
+  Done     : Boolean;
+  Peer     : TIP;
+begin
+  TftpGet := False;
+  TftpErr := '';
+  TftpBytes := 0; TftpBlocks := 0; TftpResends := 0; TftpDups := 0;
+  TftpPeerTID := 0;
+  FOpen := False;
+  Done := False;
+
+  PickPort;
+  RQLen := BuildRQ(OP_RRQ, Remote);
+
+  {$I-}
+  Assign(F, Local);
+  Rewrite(F, 1);
+  {$I+}
+  if IOResult <> 0 then
+  begin
+    TftpErr := 'cannot create ' + Local;
+    Exit;
+  end;
+  FOpen := True;
+
+  if not NetUdpSend(MyPort, SrvPort, Pkt, RQLen) then
+  begin
+    TftpErr := NetErr;
+    Close(F);
+    Erase(F);
+    Exit;
+  end;
+
+  Expect := 1;
+  Tries  := 0;
+  Wait   := FirstWait;
+  TftpStallRx := 0; TftpStallWrong := 0; TftpStallDrop := 0;
+  MarkRx := NetRxFrames; MarkWr := NetRxWrong; MarkDr := NetRxDrop;
+  DeadRuns := 0;
+  DeadMark := -1;
+  TftpRestarts := 0;
+  Peer := NetPeerIP;
+  TftpBlkSize := TFTP_BLK;
+
+  while not Done do
+  begin
+    if not NetUdpRecv(MyPort, RxP, SizeOf(RxP), Got, Wait) then
+    begin
+      { Nothing arrived. Resend whatever we last said and try again -- except
+        for the very first request when the caller told us not to, which is
+        the long-poll case: the server is holding the request deliberately
+        and a retransmit would make it look like a second poll. }
+      Inc(Tries);
+      if TftpPeerTID = 0 then
+      begin
+        { Still waiting for the first packet, so it is the REQUEST that went
+          missing (or is still being held). Resending is safe even for the
+          long poll, because dosd ignores a repeat request from a client it
+          is already holding one for -- without that deduplication a
+          retransmit would start a second hold and take a second job. }
+        if not RetryFirst then MaxRq := 0 else MaxRq := MAX_RQ_TRIES;
+        if Tries > MaxRq then
+        begin
+          TftpErr := 'no reply after ' + Num(Tries) + ' requests';
+          Break;
+        end;
+        Inc(TftpResends);
+        RQLen := BuildRQ(OP_RRQ, Remote);
+        NetUdpSend(MyPort, SrvPort, Pkt, RQLen);
+        Wait := FirstWait;
+      end
+      else
+      begin
+        { Silence begins HERE, not at the previous restart.
+
+          The first version marked the counters at transfer start and took the
+          delta at the restart, so the "stall window" for the first stall
+          spanned the entire successful transfer before it -- and duly
+          reported a hundred frames as having arrived during the silence.
+          They were the good blocks. A window that includes the thing it is
+          meant to exclude measures nothing. }
+        { Tries = 1, not 0: Inc(Tries) runs BEFORE this branch, so testing
+          for 0 here can never fire and the mark silently stayed at its
+          transfer-start value -- which is the same artifact this was written
+          to remove, a second time. }
+        if Tries = 1 then
+        begin
+          MarkRx := NetRxFrames; MarkWr := NetRxWrong; MarkDr := NetRxDrop;
+        end;
+
+        { A stall on this link is not a lost packet. The server keeps
+          sending -- its own trace shows the block going out again on every
+          duplicate ACK we send -- and none of it reaches us, while broadcast
+          frames keep arriving perfectly well throughout. Re-taking the
+          packet driver handle does not help, and nor does putting the card
+          into promiscuous mode so it accepts every frame on the wire. Both
+          were built, measured and removed.
+
+          What always works is a completely fresh flow: every transfer that
+          stalled succeeded on the next attempt. So build one here rather
+          than making the caller do it -- drop the handle and the ARP state,
+          take a new local port, and ask for the rest of the file from where
+          we got to. The file stays open and we keep appending, so nothing
+          already received is fetched twice. }
+        if (Tries >= RESTART_AFTER) and (TftpRestarts < MAX_RESTARTS) then
+        begin
+          { What reached the card during the silence just ended -- from the
+            first missed reply to now, and nothing before it. }
+          Inc(TftpStallRx,    NetRxFrames - MarkRx);
+          Inc(TftpStallWrong, NetRxWrong  - MarkWr);
+          Inc(TftpStallDrop,  NetRxDrop   - MarkDr);
+          MarkRx := NetRxFrames; MarkWr := NetRxWrong; MarkDr := NetRxDrop;
+
+          { Did the last flow achieve anything? }
+          if TftpBytes = DeadMark then
+            Inc(DeadRuns)
+          else
+            DeadRuns := 0;
+          DeadMark := TftpBytes;
+          if DeadRuns > DEAD_RESTARTS then
+          begin
+            TftpErr := 'no answer from the server';
+            Break;
+          end;
+          Inc(TftpRestarts);
+          NetClose;
+          if not NetOpen(Peer) then
+          begin
+            TftpErr := 'lost the network at block ' + Num(Expect);
+            Break;
+          end;
+          PickPort;
+          TftpPeerTID := 0;
+          Expect := 1;
+          Tries  := 0;
+          Wait   := FirstWait;
+          { The new flow negotiates from scratch, so do not assume the size
+            the old one agreed to. }
+          TftpBlkSize := TFTP_BLK;
+          RQLen := BuildRQ(OP_RRQ, Remote + '@' + Num(TftpBytes));
+          if not NetUdpSend(MyPort, SrvPort, Pkt, RQLen) then
+          begin
+            TftpErr := NetErr;
+            Break;
+          end;
+          Continue;
+        end;
+        if Tries > MAX_RETRIES then
+        begin
+          TftpErr := 'stalled at block ' + Num(Expect);
+          Break;
+        end;
+        Inc(TftpResends);
+        PutW(Pkt, 0, OP_ACK);
+        PutW(Pkt, 2, Expect - 1);
+        NetUdpSend(MyPort, TftpPeerTID, Pkt, 4);
+        Wait := TIMEOUT_TICKS;
+      end;
+      Continue;
+    end;
+
+    if Got < 4 then Continue;
+    Op := GetW(RxP, 0);
+
+    if Op = OP_ERROR then
+    begin
+      TftpErr := ErrText(Got);
+      Break;
+    end;
+    if Op = OP_OACK then
+    begin
+      { The server accepted our options. Lock on to its transfer port, take
+        the block size it agreed to, and ACK block 0 -- that ACK is what
+        tells it to start sending. }
+      if TftpPeerTID = 0 then TftpPeerTID := NetFromPort;
+      TftpBlkSize := OackBlkSize(Got);
+      PutW(Pkt, 0, OP_ACK);
+      PutW(Pkt, 2, 0);
+      NetUdpSend(MyPort, TftpPeerTID, Pkt, 4);
+      Tries := 0;
+      Wait  := TIMEOUT_TICKS;
+      Continue;
+    end;
+    if Op <> OP_DATA then Continue;
+
+    { Lock on to the server's transfer port the first time we hear from it,
+      and ignore anything from a different one afterwards. }
+    if TftpPeerTID = 0 then
+      TftpPeerTID := NetFromPort
+    else if NetFromPort <> TftpPeerTID then
+      Continue;
+
+    Blk     := GetW(RxP, 2);
+    DataLen := Got - 4;
+
+    if Blk = Expect then
+    begin
+      if DataLen > 0 then
+      begin
+        {$I-}
+        BlockWrite(F, RxP[4], DataLen, Wrote);
+        {$I+}
+        if (IOResult <> 0) or (Wrote <> Integer(DataLen)) then
+        begin
+          TftpErr := 'write failed at block ' + Num(Blk) + ' (disk full?)';
+          Break;
+        end;
+        TftpBytes := TftpBytes + DataLen;
+      end;
+      Inc(TftpBlocks);
+
+      PutW(Pkt, 0, OP_ACK);
+      PutW(Pkt, 2, Blk);
+      NetUdpSend(MyPort, TftpPeerTID, Pkt, 4);
+
+      { A short block is the end of the transfer, by definition. A file that
+        is an exact multiple of the block size ends with a zero-length one. }
+      if DataLen < TftpBlkSize then
+      begin
+        Done := True;
+        TftpGet := True;
+      end;
+      Inc(Expect);
+      Tries := 0;
+      Wait := TIMEOUT_TICKS;
+    end
+    else if Blk = (Expect - 1) then
+    begin
+      { The server did not hear our ACK and sent the block again. Re-ACK it
+        WITHOUT writing, or the file gains a duplicate 512 bytes -- the
+        classic way a stop-and-wait transfer corrupts silently. }
+      Inc(TftpDups);
+      PutW(Pkt, 0, OP_ACK);
+      PutW(Pkt, 2, Blk);
+      NetUdpSend(MyPort, TftpPeerTID, Pkt, 4);
+    end;
+    { Anything else is a stray from an older exchange: ignore it. }
+  end;
+
+  if FOpen then
+  begin
+    {$I-}
+    Close(F);
+    {$I+}
+    if IOResult <> 0 then ;
+    { A failed download leaves no file behind. Half a program on disk that
+      IF EXIST will happily find is worse than none -- the job batches test
+      for existence, not for correctness. }
+    if not Done then
+    begin
+      {$I-}
+      Assign(F, Local);
+      Erase(F);
+      {$I+}
+      if IOResult <> 0 then ;
+    end;
+  end;
+end;
+
+function TftpPut(SrvPort: Word; const Local, Remote: ShortString): Boolean;
+var
+  F       : file;
+  FOpen   : Boolean;
+  RQLen   : Word;
+  Got     : Word;
+  Op, Blk : Word;
+  Block   : Word;
+  Tries   : Integer;
+  DeadRuns: Integer;           { consecutive restarts that moved nothing }
+  DeadMark: LongInt;           { TftpBytes as of the last restart }
+  MarkRx, MarkWr, MarkDr : Word;   { receiver counters at the last restart }
+  ReadLen : Integer;
+  Done    : Boolean;
+  Sent    : Boolean;
+  Restart : Boolean;
+  LastLen : Word;
+  Peer    : TIP;
+  RQName  : ShortString;
+
+  { The write request, and the wait for whatever opens the transfer: an ACK
+    of block 0, or an OACK if the server took our options. Factored out
+    because a flow rebuilt after a stall has to do the whole thing again, and
+    two hand-copied versions of a handshake is how they drift. }
+  function Handshake: Boolean;
+  var T: Integer;
+  begin
+    Handshake := False;
+    T := 0;
+    while TftpPeerTID = 0 do
+    begin
+      if NetUdpRecv(MyPort, RxP, SizeOf(RxP), Got, TIMEOUT_TICKS) then
+      begin
+        if Got >= 4 then
+        begin
+          Op := GetW(RxP, 0);
+          if Op = OP_ERROR then
+          begin
+            TftpErr := ErrText(Got);
+            Exit;
+          end;
+          { An OACK opens the write in place of ACK 0 (RFC 2347). Unlike a
+            read we do not answer it -- the first DATA block is the answer. }
+          if Op = OP_OACK then
+          begin
+            TftpBlkSize := OackBlkSize(Got);
+            TftpPeerTID := NetFromPort;
+          end
+          else if (Op = OP_ACK) and (GetW(RxP, 2) = 0) then
+            TftpPeerTID := NetFromPort;
+        end;
+      end
+      else
+      begin
+        Inc(T);
+        if T > MAX_RETRIES then
+        begin
+          TftpErr := 'no ACK for the write request';
+          Exit;
+        end;
+        Inc(TftpResends);
+        RQLen := BuildRQ(OP_WRQ, RQName);
+        NetUdpSend(MyPort, SrvPort, Pkt, RQLen);
+      end;
+    end;
+    Handshake := True;
+  end;
+
+begin
+  TftpPut := False;
+  TftpErr := '';
+  TftpBytes := 0; TftpBlocks := 0; TftpResends := 0; TftpDups := 0;
+  TftpPeerTID := 0;
+  TftpBlkSize := TFTP_BLK;
+  TftpStallRx := 0; TftpStallWrong := 0; TftpStallDrop := 0;
+  MarkRx := NetRxFrames; MarkWr := NetRxWrong; MarkDr := NetRxDrop;
+  DeadRuns := 0;
+  DeadMark := -1;
+  TftpRestarts := 0;
+  Peer := NetPeerIP;
+  Done := False;
+  Restart := False;
+
+  {$I-}
+  Assign(F, Local);
+  Reset(F, 1);
+  {$I+}
+  if IOResult <> 0 then
+  begin
+    TftpErr := 'cannot open ' + Local;
+    Exit;
+  end;
+  FOpen := True;
+
+  PickPort;
+  RQName := Remote;
+  RQLen := BuildRQ(OP_WRQ, RQName);
+  if not NetUdpSend(MyPort, SrvPort, Pkt, RQLen) then
+  begin
+    TftpErr := NetErr;
+    Close(F);
+    Exit;
+  end;
+  if not Handshake then
+  begin
+    Close(F);
+    Exit;
+  end;
+
+  Block   := 1;
+  LastLen := TftpBlkSize;
+  while not Done do
+  begin
+    {$I-}
+    BlockRead(F, Pkt[4], TftpBlkSize, ReadLen);
+    {$I+}
+    if IOResult <> 0 then
+    begin
+      TftpErr := 'read failed on ' + Local;
+      Break;
+    end;
+    LastLen := Word(ReadLen);
+    PutW(Pkt, 0, OP_DATA);
+    PutW(Pkt, 2, Block);
+
+    Tries := 0;
+    Sent  := False;
+    NetUdpSend(MyPort, TftpPeerTID, Pkt, 4 + LastLen);
+
+    while not Sent do
+    begin
+      if NetUdpRecv(MyPort, RxP, SizeOf(RxP), Got, TIMEOUT_TICKS) then
+      begin
+        if Got >= 4 then
+        begin
+          Op := GetW(RxP, 0);
+          if Op = OP_ERROR then
+          begin
+            TftpErr := ErrText(Got);
+            Close(F);
+            Exit;
+          end;
+          if (Op = OP_ACK) and (NetFromPort = TftpPeerTID) then
+          begin
+            Blk := GetW(RxP, 2);
+            if Blk = Block then Sent := True
+            else
+            begin
+              { A duplicate ACK for an EARLIER block means the block we are
+                sending never arrived. Resend it now -- and do NOT let it
+                count towards a restart: a duplicate ACK is proof the far end
+                is alive and listening, which is the opposite of a stall.
+
+                Counting the duplicate and looping -- which is what this did
+                -- goes back to waiting with a fresh two-second timer. The
+                server, having timed out, re-ACKs the last block it holds
+                every two seconds, and each of those restarted this timer, so
+                we never reached our own timeout and never retransmitted while
+                it sat waiting for a block that was never coming. That is the
+                same deadlock that broke every large DOWNLOAD until dosd
+                stopped doing exactly this, mirrored into the upload path. }
+              Inc(TftpDups);
+              Inc(Tries);
+              if Tries > MAX_RETRIES then
+              begin
+                TftpErr := 'stalled at block ' + Num(Block);
+                Close(F);
+                Exit;
+              end;
+              Inc(TftpResends);
+              PutW(Pkt, 0, OP_DATA);
+              PutW(Pkt, 2, Block);
+              NetUdpSend(MyPort, TftpPeerTID, Pkt, 4 + LastLen);
+            end;
+          end;
+        end;
+      end
+      else
+      begin
+        if Tries = 0 then
+        begin
+          MarkRx := NetRxFrames; MarkWr := NetRxWrong; MarkDr := NetRxDrop;
+        end;
+        Inc(Tries);
+        { Silence, repeatedly. This is the link fault that no amount of
+          retrying fixes -- frames stop being delivered to this card partway
+          through a transfer while broadcasts keep arriving -- and the only
+          thing that has ever cleared it is a completely fresh flow. The
+          download path has done this since the 5 MB transfers were made to
+          work; without it here a large `dospull` simply fails, which is
+          exactly what it did the first time one was tried. }
+        if (Tries >= RESTART_AFTER) and (TftpRestarts < MAX_RESTARTS) then
+        begin
+          { What reached the card during the silence just ended -- same
+            measurement as the read path, since a dospull stalls too. }
+          Inc(TftpStallRx,    NetRxFrames - MarkRx);
+          Inc(TftpStallWrong, NetRxWrong  - MarkWr);
+          Inc(TftpStallDrop,  NetRxDrop   - MarkDr);
+          MarkRx := NetRxFrames; MarkWr := NetRxWrong; MarkDr := NetRxDrop;
+
+          { Same rule as the read path: a restart that shifted no bytes at all
+            means the far end is gone, not slow. }
+          if TftpBytes = DeadMark then
+            Inc(DeadRuns)
+          else
+            DeadRuns := 0;
+          DeadMark := TftpBytes;
+          if DeadRuns > DEAD_RESTARTS then
+          begin
+            TftpErr := 'no answer from the server';
+            Close(F);
+            Exit;
+          end;
+          Restart := True;
+          Sent    := True;          { leave the inner loop, not the transfer }
+        end
+        else if Tries > MAX_RETRIES then
+        begin
+          TftpErr := 'stalled at block ' + Num(Block);
+          Close(F);
+          Exit;
+        end
+        else
+        begin
+          Inc(TftpResends);
+          { Rebuild: RxP and Pkt are separate buffers, so Pkt still holds the
+            block we are trying to place. }
+          PutW(Pkt, 0, OP_DATA);
+          PutW(Pkt, 2, Block);
+          NetUdpSend(MyPort, TftpPeerTID, Pkt, 4 + LastLen);
+        end;
+      end;
+    end;
+
+    if Restart then
+    begin
+      Inc(TftpRestarts);
+      Restart := False;
+      NetClose;
+      if not NetOpen(Peer) then
+      begin
+        TftpErr := NetErr;
+        Break;
+      end;
+      PickPort;
+      TftpPeerTID := 0;
+      { The new flow negotiates from scratch, so do not carry over the size
+        the old one agreed to. }
+      TftpBlkSize := TFTP_BLK;
+      RQName := Remote + '@' + Num(TftpBytes);
+      RQLen  := BuildRQ(OP_WRQ, RQName);
+      if not NetUdpSend(MyPort, SrvPort, Pkt, RQLen) then
+      begin
+        TftpErr := NetErr;
+        Break;
+      end;
+      if not Handshake then Break;
+      { Rewind to what the server has actually acknowledged. Anything sent
+        but unacked goes again -- at worst a duplicate, which the server
+        re-ACKs and discards rather than appending. }
+      {$I-}
+      Seek(F, TftpBytes);
+      {$I+}
+      if IOResult <> 0 then
+      begin
+        TftpErr := 'seek failed on ' + Local;
+        Break;
+      end;
+      Block := 1;
+      Continue;
+    end;
+
+    TftpBytes := TftpBytes + LastLen;
+    Inc(TftpBlocks);
+    if LastLen < TftpBlkSize then
+    begin
+      Done := True;
+      TftpPut := True;
+    end;
+    Inc(Block);
+  end;
+
+  if FOpen then
+  begin
+    {$I-}
+    Close(F);
+    {$I+}
+    if IOResult <> 0 then ;
+  end;
+end;
+
+begin
+  TftpErr := '';
+  MyPort := 20000;
+end.

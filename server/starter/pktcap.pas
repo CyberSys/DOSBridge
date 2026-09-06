@@ -28,7 +28,9 @@ program PktCap;
      with no DOS calls, no file I/O and no WriteLn. Nothing is printed until
      the handle is back. There is one path in and one path out.
 
-  2. A frame delivered to our handle is NOT delivered to mTCP's. Capturing ALL
+  2. A frame delivered to our handle is NOT delivered to anyone else's, and
+     the bridge itself is now one of those anyone-elses: UGET and UPUT run on
+     this same packet driver. Capturing ALL
      takes every frame away from the stack this bridge is using. For a few
      seconds that is survivable -- TCP retransmits, and the job's own reply is
      sent long after we have released -- but it is not free. Hence ALL is
@@ -340,8 +342,9 @@ begin
   begin
     WriteLn('  capturing      : EVERY ethertype, for ', Secs, ' second(s)');
     WriteLn('  WARNING        : frames delivered here are NOT delivered to');
-    WriteLn('                   mTCP. This bridge runs over mTCP, so it is');
-    WriteLn('                   deaf for the duration. Keep it short.');
+    WriteLn('                   anyone else -- including UGET and UPUT, which');
+    WriteLn('                   ARE this bridge. It is deaf for the duration,');
+    WriteLn('                   so keep it short.');
   end
   else
     WriteLn('  capturing      : ethertype ', Hex2(Hi(TypeW)), Hex2(Lo(TypeW)),
